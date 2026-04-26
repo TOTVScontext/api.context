@@ -7,8 +7,11 @@ import { applyCors } from '../_cors.js'
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 function validateBody(body) {
-  const { email, password } = body ?? {}
+  const { name, email, password } = body ?? {}
 
+  if (!name || typeof name !== 'string' || name.trim().length < 2) {
+    return 'Name must be at least 2 characters.'
+  }
   if (!email || typeof email !== 'string' || !EMAIL_RE.test(email.trim())) {
     return 'Invalid email address.'
   }
@@ -43,6 +46,7 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: validationError })
   }
 
+  const name = req.body.name.trim()
   const email = req.body.email.trim().toLowerCase()
   const { password } = req.body
 
@@ -69,7 +73,7 @@ export default async function handler(req, res) {
     id: data.user.id,
     email,
     profile: {
-      name: '',
+      name,
       photo: '',
       gender: '',
       country: '',
