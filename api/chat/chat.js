@@ -132,16 +132,16 @@ function buildMessages(history, userContent) {
 // ─── Streaming OpenRouter → SSE ───────────────────────────────────────────────
 
 async function streamToClient(messages, res) {
-  const model     = requireEnv('nvidia/nemotron-3-nano-30b-a3b:free')
-  const maxTokens = parseInt(optEnv('4096'), 10)
+  const model     = requireEnv('OPENROUTER_MODEL', 'nvidia/nemotron-3-nano-30b-a3b:free')
+  const maxTokens = parseInt(optEnv('OPENROUTER_MAX_TOKENS', '4096'), 10)
 
   const upstream = await fetch(OPENROUTER_URL, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${requireEnv('OPENROUTER_API_KEY')}`,
       'Content-Type':  'application/json',
-      'HTTP-Referer':  optEnv('https://totvs-context.vercel.app', 'https://localhost'),
-      'X-Title':       optEnv('TOTVScontext', 'AI Chat'),
+      'HTTP-Referer':  'https://totvs-context.vercel.app',
+      'X-Title':       'TOTVScontext',
     },
     body: JSON.stringify({
       model,
