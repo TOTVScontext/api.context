@@ -69,10 +69,10 @@ function validateBody(body) {
   const { email, password } = body ?? {}
 
   if (!email || typeof email !== 'string' || !EMAIL_RE.test(email.trim())) {
-    return 'Invalid email address.'
+    return 'Endereço de e-mail inválido.'
   }
   if (!password || typeof password !== 'string' || password.length < 8) {
-    return 'Password must be at least 8 characters.'
+    return 'A senha deve ter pelo menos 8 caracteres.'
   }
   return null
 }
@@ -102,7 +102,7 @@ export default async function handler(req, res) {
 
   if (!allowed) {
     res.setHeader('Retry-After', retryAfter)
-    return res.status(429).json({ error: 'Too many login attempts. Try again later.' })
+    return res.status(429).json({ error: 'Muitas tentativas de login. Tente novamente mais tarde.' })
   }
 
   // ── Input validation ──────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ export default async function handler(req, res) {
   if (error || !data?.user) {
     recordFailedAttempt(ip)
     // Generic message — never reveal whether email exists
-    return res.status(401).json({ error: 'Invalid credentials.' })
+    return res.status(401).json({ error: 'Credenciais inválidas.' })
   }
 
   clearAttempts(ip)

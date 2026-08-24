@@ -10,13 +10,13 @@ function validateBody(body) {
   const { name, email, password } = body ?? {}
 
   if (!name || typeof name !== 'string' || name.trim().length < 2) {
-    return 'Name must be at least 2 characters.'
+    return 'O nome deve ter pelo menos 2 caracteres.'
   }
   if (!email || typeof email !== 'string' || !EMAIL_RE.test(email.trim())) {
-    return 'Invalid email address.'
+    return 'Endereço de e-mail inválido.'
   }
   if (!password || typeof password !== 'string' || password.length < 8) {
-    return 'Password must be at least 8 characters.'
+    return 'A senha deve ter pelo menos 8 caracteres.'
   }
   return null
 }
@@ -58,7 +58,7 @@ export default async function handler(req, res) {
     .maybeSingle()
 
   if (existing) {
-    return res.status(409).json({ error: 'An account with this email already exists.' })
+    return res.status(409).json({ error: 'Já existe uma conta com este e-mail.' })
   }
 
   // ── Register ──────────────────────────────────────────────────────────────
@@ -86,7 +86,7 @@ export default async function handler(req, res) {
   if (insertError) {
     // Auth user created but profile failed — clean up to avoid orphaned auth records
     await supabase.auth.admin.deleteUser(data.user.id)
-    return res.status(500).json({ error: 'Failed to create account. Please try again.' })
+    return res.status(500).json({ error: 'Falha ao criar a conta. Por favor, tente novamente.' })
   }
 
   return res.status(201).json({ success: true })
