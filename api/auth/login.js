@@ -9,8 +9,8 @@ const loginAttempts = new Map() // key: IP → { count, firstAttempt, lockedUnti
 
 const RATE_LIMIT = {
   MAX_ATTEMPTS: 5,       // max failures before lockout
-  WINDOW_MS: 15 * 60 * 1000,   // 15-minute sliding window
-  LOCKOUT_MS: 30 * 60 * 1000,  // 30-minute lockout
+  WINDOW_MS: 5 * 60 * 1000,   // 5-minute sliding window
+  LOCKOUT_MS: 3 * 60 * 1000,  // 3-minute lockout
 }
 
 function getClientIp(req) {

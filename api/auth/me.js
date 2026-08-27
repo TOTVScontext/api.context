@@ -8,8 +8,10 @@ import { applyCors } from '../_cors.js'
 const PUBLIC_FIELDS = [
   'id',
   'email',
+  'name',
+  'photo',
+  'plan',
   'settings',
-  'profile',
   'created_at',
 ].join(', ')
 

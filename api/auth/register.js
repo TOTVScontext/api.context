@@ -72,15 +72,7 @@ export default async function handler(req, res) {
   const { error: insertError } = await supabase.from('users').insert({
     id: data.user.id,
     email,
-    profile: {
-      name,
-      photo: '',
-      banner: 'https://st3.depositphotos.com/11660552/17822/v/450/depositphotos_178221814-stock-illustration-pixel-background-desert.jpg',
-      gender: '',
-      position: '',
-      country: '',
-      birthDate: '',
-    },
+    name,
   })
 
   if (insertError) {
