@@ -84,63 +84,77 @@ const DEFAULT_ANALYSIS_DATA = {
     },
 }
 
-/** JSON padrão do relatório narrativo (fallback em caso de falha do modelo) */
-const DEFAULT_REPORT_DATA = {
-    sumario_executivo: '',
-    engajamento: '',
-    comunicacao: '',
-    sentimento: '',
-    saude_cliente: '',
-    progresso_comercial: '',
-    execucao_reuniao: '',
-    riscos: [],
-    inteligencia_comercial: '',
-    recomendacoes: [],
-    objetivo_cumprido: 'partial',
-}
-
 // ─── Prompts do Sistema ───────────────────────────────────────────────────────
 
 /**
- * Instrução para geração do relatório narrativo corporativo (coluna `analysis`).
- * Saída é JSON puro e compacto — sem Markdown, sem preâmbulo — o que reduz o
- * tempo de geração e mantém o resultado profissional e direto ao ponto.
+ * Especificação estruturada (JSON) do relatório narrativo corporativo (coluna
+ * `analysis`). A instrução é escrita como JSON — mais determinística e fácil de
+ * versionar do que um bloco de texto livre — mas o CONTEÚDO GERADO pelo modelo
+ * deve ser Markdown puro, pronto para conversão em PDF seguindo um sistema
+ * visual inspirado no IBM Carbon Design (fundo predominantemente branco, texto
+ * em preto/cinza-escuro, e um dourado usado com extrema sobriedade apenas em
+ * pontos de destaque). O objetivo da reunião ("success" | "partial" | "fail")
+ * vem embutido em um comentário HTML de metadados no fim do documento, para
+ * ser extraído programaticamente sem poluir o corpo visível do relatório.
  */
-const SYSTEM_PROMPT_ANALYSIS = `\
-Você é um consultor sênior de vendas B2B e diagnóstico de reuniões corporativas.
-Analise a transcrição fornecida e produza um diagnóstico executivo, objetivo e
-estritamente fundamentado em evidências da própria transcrição.
-
-REGRAS ABSOLUTAS:
-• Responda APENAS com um objeto JSON válido — sem Markdown, sem blocos de código,
-  sem texto fora do JSON.
-• Cada campo textual deve ter no máximo 2-3 frases: direto, específico, sem
-  enrolação e sem generalidades vazias ("a reunião foi produtiva" não é aceitável
-  sem uma evidência concreta que sustente a afirmação).
-• Nunca invente fatos, participantes, números ou trechos que não constem na
-  transcrição. Se a informação não existir, declare isso explicitamente no campo
-  ("Transcrição não contém elementos suficientes para avaliar este ponto.").
-• Tom executivo, direto e sem emojis.
-• "objetivo_cumprido" deve refletir, com base exclusiva em evidências da
-  transcrição, se o objetivo declarado ou implícito da reunião foi atingido:
-  "success" (objetivo claramente cumprido), "partial" (parcialmente cumprido ou
-  resultado misto), "fail" (não cumprido ou reunião sem avanço/definição).
-
-SCHEMA OBRIGATÓRIO (preencha todos os campos, todos em português):
-{
-  "sumario_executivo": "<visão geral objetiva: contexto, principais achados e recomendação prioritária>",
-  "engajamento": "<qualidade do engajamento, atenção e participação efetiva dos presentes>",
-  "comunicacao": "<clareza, objetividade, escuta ativa e manejo de objeções observados>",
-  "sentimento": "<clima geral da reunião — tensão, confiança, resistência — do lado do cliente e da equipe>",
-  "saude_cliente": "<sinais de satisfação, confiança e aderência da solução às necessidades do cliente>",
-  "progresso_comercial": "<avanço no ciclo de vendas, valor percebido e urgência demonstrada>",
-  "execucao_reuniao": "<gestão do tempo, aderência à agenda e clareza dos próximos passos definidos>",
-  "riscos": ["<risco concreto 1 com evidência>", "<risco concreto 2>", "<risco concreto 3 (opcional)>"],
-  "inteligencia_comercial": "<sinais de compra, alinhamento e momentum de decisão identificados>",
-  "recomendacoes": ["<ação prioritária 1 — específica e acionável>", "<ação 2>", "<ação 3 (opcional)>"],
-  "objetivo_cumprido": "success" | "partial" | "fail"
-}
-`
+const SYSTEM_PROMPT_ANALYSIS = JSON.stringify({
+    papel: 'Consultor sênior de vendas B2B e diagnóstico de reuniões corporativas.',
+    objetivo: 'Produzir um diagnóstico executivo enxuto, bem fundamentado e não repetitivo, ' +
+        'baseado exclusivamente em evidências da transcrição fornecida.',
+    principios_de_analise: [
+        'Cada afirmação relevante deve se apoiar em uma evidência concreta da transcrição — nunca em generalidade vazia (ex.: "a reunião foi produtiva" sem evidência é inaceitável).',
+        'Nunca invente fatos, participantes, números, datas ou trechos que não constem na transcrição.',
+        'Se a transcrição não contiver elementos suficientes para avaliar um ponto, declare isso objetivamente em vez de preencher com texto genérico.',
+        'Cada seção deve agregar informação nova: não repita a mesma conclusão, métrica ou evidência em mais de uma seção.',
+        'Tom executivo, direto, sem floreios e sem emojis.',
+    ],
+    formato_de_saida: {
+        tipo: 'markdown',
+        proibido: ['JSON', 'HTML visível', 'blocos de código ```', 'emojis', 'itálico decorativo'],
+        proposito: 'Este documento será convertido diretamente em PDF.',
+        sistema_visual: {
+            inspiracao: 'IBM Carbon Design System',
+            paleta: {
+                fundo: '50% branco',
+                texto: '45% preto / cinza-grafite',
+                destaque: '15% dourado — aplicado com extrema sutileza, apenas em elementos que o layout tratará como destaque',
+            },
+            elementos_que_recebem_destaque_dourado_na_diagramacao: [
+                'blockquotes (>) — usar apenas para o veredito do objetivo da reunião e para o risco mais crítico',
+                'a linha divisória (---) entre o bloco de métricas e o restante do relatório',
+            ],
+            regras_de_formatacao: [
+                'Um único H1 no topo com o título "Relatório de Análise de Reunião".',
+                'H2 para cada seção principal, sem numeração manual (o layout numera automaticamente).',
+                'Uma única tabela Markdown consolidando as métricas-chave da reunião — não repetir esses números em prosa nas seções seguintes.',
+                'Usar blockquote (>) somente para o veredito do objetivo da reunião e para, no máximo, um risco crítico — nunca para texto comum.',
+                'Negritar (**termo**) apenas termos que sustentam diretamente uma conclusão, nunca frases inteiras ou seções completas.',
+                'Usar "---" apenas para separar o bloco de métricas do restante do corpo do relatório.',
+                'Fechar o documento com uma linha de metadados invisível ao leitor, no formato exato: <!--METADATA:{"objetivo_cumprido":"success"}--> (substituindo o valor por "success", "partial" ou "fail" conforme a avaliação).',
+            ],
+        },
+    },
+    estrutura_do_relatorio: [
+        '# Relatório de Análise de Reunião',
+        '## Sumário Executivo — contexto, achados centrais e recomendação prioritária, em no máximo 4 frases.',
+        '## Panorama de Métricas — tabela Markdown com as 5-6 métricas mais decisivas da reunião, cada uma com uma leitura objetiva de uma frase.',
+        '---',
+        '## Engajamento & Comunicação — síntese única cobrindo participação, clareza, escuta ativa e manejo de objeções, sem repetir o panorama de métricas.',
+        '## Saúde do Cliente & Progresso Comercial — sinais de satisfação, confiança, aderência da solução e avanço no ciclo de vendas.',
+        '## Riscos Críticos — no máximo 3 riscos, cada um com evidência e impacto estimado; o mais crítico em blockquote.',
+        '## Inteligência Comercial & Próximos Passos — sinais de compra, momentum de decisão e recomendações acionáveis (responsável, prazo e objetivo quando a transcrição permitir inferi-los).',
+        '> **Objetivo da reunião:** veredito em um parágrafo curto (cumprido, parcial ou não cumprido), com a evidência que sustenta essa conclusão.',
+    ],
+    objetivo_cumprido: {
+        campo: 'objetivo_cumprido (embutido no comentário de metadados final, nunca no corpo visível)',
+        criterio: 'Avaliação exclusiva com base em evidências da transcrição, sobre o objetivo declarado ou implícito da reunião.',
+        valores: {
+            success: 'objetivo claramente cumprido',
+            partial: 'parcialmente cumprido ou resultado misto',
+            fail: 'não cumprido, ou reunião sem avanço/definição relevante',
+        },
+    },
+}, null, 2)
 
 /**
  * Instrução para geração do JSON de métricas (coluna `analysis_data`).
@@ -153,7 +167,7 @@ tarefa é converter evidências da transcrição em métricas numéricas objetiv
 REGRAS ABSOLUTAS:
 • Responda APENAS com o objeto JSON do schema abaixo — sem texto adicional,
   sem blocos de código, sem explicação, sem comentários.
-• Todos os valores são inteiros entre 0 e 100, onde:
+• Todos os valores são numeros Reais entre 0 e 100, onde:
   0–20   = Muito baixo / crítico
   21–40  = Baixo / abaixo do esperado
   41–60  = Médio / aceitável
@@ -169,66 +183,66 @@ REGRAS ABSOLUTAS:
 SCHEMA OBRIGATÓRIO (preencha todos os campos):
 {
   "meeting_analysis": {
-    "effectiveness": <int>,
-    "productivity": <int>,
-    "goal_achievement": <int>,
-    "decision_quality": <int>
+    "effectiveness": <bool>,
+    "productivity": <bool>,
+    "goal_achievement": <bool>,
+    "decision_quality": <bool>
   },
   "engagement": {
-    "overall": <int>,
-    "participation": <int>,
-    "interaction": <int>,
-    "attention": <int>
+    "overall": <bool>,
+    "participation": <bool>,
+    "interaction": <bool>,
+    "attention": <bool>
   },
   "communication": {
-    "clarity": <int>,
-    "objectivity": <int>,
-    "persuasion": <int>,
-    "active_listening": <int>,
-    "objection_handling": <int>
+    "clarity": <bool>,
+    "objectivity": <bool>,
+    "persuasion": <bool>,
+    "active_listening": <bool>,
+    "objection_handling": <bool>
   },
   "sentiment": {
-    "client": <int>,
-    "team": <int>,
-    "positivity": <int>,
-    "negativity": <int>
+    "client": <bool>,
+    "team": <bool>,
+    "positivity": <bool>,
+    "negativity": <bool>
   },
   "customer": {
-    "satisfaction": <int>,
-    "trust": <int>,
-    "engagement_level": <int>,
-    "pain_understanding": <int>,
-    "solution_fit": <int>
+    "satisfaction": <bool>,
+    "trust": <bool>,
+    "engagement_level": <bool>,
+    "pain_understanding": <bool>,
+    "solution_fit": <bool>
   },
   "business": {
-    "deal_progress": <int>,
-    "conversion_likelihood": <int>,
-    "perceived_value": <int>,
-    "expected_value": <int>,
-    "urgency": <int>
+    "deal_progress": <bool>,
+    "conversion_likelihood": <bool>,
+    "perceived_value": <bool>,
+    "expected_value": <bool>,
+    "urgency": <bool>
   },
   "execution": {
-    "time_management": <int>,
-    "agenda_adherence": <int>,
-    "next_steps_clarity": <int>,
-    "follow_up_quality": <int>
+    "time_management": <bool>,
+    "agenda_adherence": <bool>,
+    "next_steps_clarity": <bool>,
+    "follow_up_quality": <bool>
   },
   "risk": {
-    "churn": <int>,
-    "deal_loss": <int>,
-    "objection": <int>,
-    "disengagement": <int>
+    "churn": <bool>,
+    "deal_loss": <bool>,
+    "objection": <bool>,
+    "disengagement": <bool>
   },
   "intelligence": {
-    "alignment": <int>,
-    "buying_signal": <int>,
-    "decision_momentum": <int>,
-    "stakeholder_influence": <int>
+    "alignment": <bool>,
+    "buying_signal": <bool>,
+    "decision_momentum": <bool>,
+    "stakeholder_influence": <bool>
   },
   "summary_scores": {
-    "overall_score": <int>,
-    "client_health": <int>,
-    "deal_health": <int>
+    "overall_score": <bool>,
+    "client_health": <bool>,
+    "deal_health": <bool>
   }
 }
 `
@@ -393,40 +407,37 @@ function parseAndValidateScores(rawText) {
 }
 
 /**
- * Extrai e valida o JSON do relatório narrativo retornado pelo modelo.
- * Garante que todos os campos existam com os tipos corretos.
+ * Extrai o veredito do objetivo (`objetivo_cumprido`) do comentário de
+ * metadados embutido ao final do relatório Markdown, e retorna o Markdown já
+ * limpo desse comentário (o comentário não deve ser persistido/exibido).
+ *
+ * Formato esperado ao final do documento:
+ *   <!--METADATA:{"objetivo_cumprido":"success"}-->
  */
-function parseAndValidateReport(rawText) {
+function extractGoalAndCleanReport(rawText) {
     const cleaned = stripCodeFence(rawText)
+    const metadataRegex = /<!--\s*METADATA:\s*(\{[^]*?\})\s*-->/i
+    const match = cleaned.match(metadataRegex)
 
-    let parsed
-    try {
-        parsed = JSON.parse(cleaned)
-    } catch (err) {
-        throw new Error(`JSON de relatório inválido: ${err.message}. Raw: ${cleaned.slice(0, 200)}`)
+    let goal = 'partial'
+    if (match) {
+        try {
+            const parsedMeta = JSON.parse(match[1])
+            if (VALID_GOALS.has(parsedMeta?.objetivo_cumprido)) {
+                goal = parsedMeta.objetivo_cumprido
+            }
+        } catch {
+            // Metadados malformados — mantém o fallback "partial" sem abortar a análise
+        }
     }
 
-    const asText = (v, fallback = '') => (typeof v === 'string' && v.trim() ? v.trim() : fallback)
-    const asList = (v) => (Array.isArray(v) ? v.filter((i) => typeof i === 'string' && i.trim()) : [])
+    const markdown = cleaned.replace(metadataRegex, '').trimEnd()
 
-    const goal = VALID_GOALS.has(parsed?.objetivo_cumprido) ? parsed.objetivo_cumprido : 'partial'
-
-    return {
-        report: {
-            sumario_executivo: asText(parsed?.sumario_executivo),
-            engajamento: asText(parsed?.engajamento),
-            comunicacao: asText(parsed?.comunicacao),
-            sentimento: asText(parsed?.sentimento),
-            saude_cliente: asText(parsed?.saude_cliente),
-            progresso_comercial: asText(parsed?.progresso_comercial),
-            execucao_reuniao: asText(parsed?.execucao_reuniao),
-            riscos: asList(parsed?.riscos),
-            inteligencia_comercial: asText(parsed?.inteligencia_comercial),
-            recomendacoes: asList(parsed?.recomendacoes),
-            objetivo_cumprido: goal,
-        },
-        goal,
+    if (!markdown) {
+        throw new Error('O relatório retornado pelo modelo está vazio após a remoção dos metadados.')
     }
+
+    return { markdown, goal }
 }
 
 // ─── Banco de Dados ───────────────────────────────────────────────────────────
@@ -507,7 +518,7 @@ async function dbDeleteAnalysis(userId, meetingId) {
  * {
  *   "id":            "uuid",
  *   "title":         "string",
- *   "analysis":      { ... relatório estruturado ... },
+ *   "analysis":      "# Relatório de Análise de Reunião\n\n...(Markdown pronto para PDF)...",
  *   "analysis_data": { ... scores ... },
  *   "size":          "14.2 KB",
  *   "goal":          "success" | "partial" | "fail",
@@ -542,9 +553,10 @@ async function handleAnalyze(req, res, userId) {
     const transcriptSize = formatSize(Buffer.byteLength(transcriptStr, 'utf8'))
 
     // ── Configura tokens máximos ──────────────────────────────────────────────
-    // Relatório agora é JSON compacto (não Markdown extenso) — teto de tokens
-    // reduzido, o que também acelera a geração sem perder profundidade analítica.
-    const maxTokensAnalysis = parseInt(optEnv('OPENROUTER_MAX_TOKENS', '3072'), 10)
+    // Relatório em Markdown enxuto (sem repetição entre seções) — teto de tokens
+    // moderado, suficiente para a tabela de métricas e as seções concisas, sem
+    // abrir espaço para prolixidade.
+    const maxTokensAnalysis = parseInt(optEnv('OPENROUTER_MAX_TOKENS', '3584'), 10)
     const maxTokensScores = 2048   // JSON de scores é compacto
 
     // ── Prompt de usuário compartilhado ──────────────────────────────────────
@@ -562,11 +574,11 @@ async function handleAnalyze(req, res, userId) {
         return sendError(res, 502, 'Falha ao gerar o relatório de análise. Tente novamente.')
     }
 
-    let reportData
+    let reportMarkdown
     let goal
     try {
-        const parsed = parseAndValidateReport(analysisSettled.value)
-        reportData = parsed.report
+        const parsed = extractGoalAndCleanReport(analysisSettled.value)
+        reportMarkdown = parsed.markdown
         goal = parsed.goal
     } catch (err) {
         console.error('[analyze] Erro ao interpretar relatório narrativo:', err.message)
@@ -595,7 +607,7 @@ async function handleAnalyze(req, res, userId) {
     try {
         savedRecord = await dbSaveAnalysis(
             userId, meetingId, finalTitle,
-            reportData, analysisData,
+            reportMarkdown, analysisData,
             transcriptSize, goal, body.transcript,
         )
     } catch (err) {
@@ -604,7 +616,7 @@ async function handleAnalyze(req, res, userId) {
         return res.status(200).json({
             id: meetingId,
             title: finalTitle,
-            analysis: reportData,
+            analysis: reportMarkdown,
             analysis_data: analysisData,
             size: transcriptSize,
             goal,
@@ -617,7 +629,7 @@ async function handleAnalyze(req, res, userId) {
     return res.status(200).json({
         id: savedRecord?.id ?? meetingId,
         title: savedRecord?.title ?? finalTitle,
-        analysis: reportData,
+        analysis: reportMarkdown,
         analysis_data: analysisData,
         size: transcriptSize,
         goal,
