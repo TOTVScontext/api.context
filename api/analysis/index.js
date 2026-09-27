@@ -13,7 +13,7 @@
  * Variáveis de Ambiente (Vercel → Settings → Environment Variables)
  * ─────────────────────────────────────────────────────────────────
  *  OPENROUTER_API_KEY        Chave de API do OpenRouter (obrigatória)
- *  OPENROUTER_MODEL          Modelo a usar (padrão: google/gemini-2.0-flash-001)
+ *  OPENROUTER_MODEL          Modelo a usar (padrão: nvidia/nemotron-3-ultra-550b-a55b:free)
  *  OPENROUTER_MAX_TOKENS     Tokens máximos do relatório (padrão: 3072)
  *  SUPABASE_URL              URL do projeto Supabase (obrigatória)
  *  SUPABASE_SERVICE_ROLE_KEY Chave service role do Supabase (obrigatória)
@@ -49,7 +49,7 @@ const RL_MAX_REQS = 10       // análises são pesadas — limite conservador
 
 const VALID_GOALS = new Set(['success', 'partial', 'fail'])
 
-// ─── JSON padrão de métricas (scores 0-100) ───────────────────────────────────
+// ─── JSON padrão de métricas (escala numérica 0-100, com casas decimais) ──────
 
 const DEFAULT_ANALYSIS_DATA = {
     meeting_analysis: {
@@ -158,91 +158,100 @@ const SYSTEM_PROMPT_ANALYSIS = JSON.stringify({
 
 /**
  * Instrução para geração do JSON de métricas (coluna `analysis_data`).
+ * Cada métrica é um número na escala 0-100 com precisão decimal (ex.: 62.5) —
+ * a granularidade decimal é intencional para alimentar gráficos com mais
+ * precisão do que uma escala de inteiros arredondados permitiria.
  * Resposta DEVE ser JSON puro — sem Markdown, sem explicação.
  */
 const SYSTEM_PROMPT_SCORES = `\
 Você é um sistema de pontuação quantitativa de reuniões comerciais. Sua única
-tarefa é converter evidências da transcrição em métricas numéricas objetivas.
+tarefa é converter evidências da transcrição em métricas numéricas objetivas e
+granulares, prontas para alimentar gráficos precisos.
 
 REGRAS ABSOLUTAS:
 • Responda APENAS com o objeto JSON do schema abaixo — sem texto adicional,
   sem blocos de código, sem explicação, sem comentários.
-• Todos os valores são numeros Reais entre 0 e 100, onde:
-  0–20   = Muito baixo / crítico
-  21–40  = Baixo / abaixo do esperado
-  41–60  = Médio / aceitável
-  61–80  = Bom / acima da média
-  81–100 = Excelente / referência
-• Cada pontuação deve ser uma inferência fiel e proporcional às evidências
-  concretas presentes na transcrição — nunca uma estimativa genérica.
-• Se a transcrição não contiver evidência suficiente para uma métrica específica,
-  atribua 0 a essa métrica em vez de estimar ou arredondar para cima.
-• Não infle pontuações para parecer "positivo": a fidelidade ao dado tem
+• Todos os valores são números na escala 0 a 100, com UMA casa decimal
+  (ex.: 62.5, 8.0, 91.3) — nunca booleanos, strings ou valores nulos.
+  A casa decimal é obrigatória mesmo quando o valor é redondo (use 80.0, não 80).
+• Escala de referência:
+  0.0–20.0   = Muito baixo / crítico
+  20.1–40.0  = Baixo / abaixo do esperado
+  40.1–60.0  = Médio / aceitável
+  60.1–80.0  = Bom / acima da média
+  80.1–100.0 = Excelente / referência
+• Cada valor deve ser uma inferência fiel e proporcional às evidências
+  concretas presentes na transcrição — nunca uma estimativa genérica ou um
+  número "redondo" escolhido por conveniência.
+• Se a transcrição não contiver evidência suficiente para uma métrica
+  específica, atribua 0.0 a essa métrica em vez de estimar ou arredondar para
+  cima.
+• Não infle valores para parecer "positivo": a fidelidade ao dado tem
   prioridade absoluta sobre qualquer tom favorável.
 
-SCHEMA OBRIGATÓRIO (preencha todos os campos):
+SCHEMA OBRIGATÓRIO (preencha todos os campos, números com uma casa decimal):
 {
   "meeting_analysis": {
-    "effectiveness": <bool>,
-    "productivity": <bool>,
-    "goal_achievement": <bool>,
-    "decision_quality": <bool>
+    "effectiveness": <float>,
+    "productivity": <float>,
+    "goal_achievement": <float>,
+    "decision_quality": <float>
   },
   "engagement": {
-    "overall": <bool>,
-    "participation": <bool>,
-    "interaction": <bool>,
-    "attention": <bool>
+    "overall": <float>,
+    "participation": <float>,
+    "interaction": <float>,
+    "attention": <float>
   },
   "communication": {
-    "clarity": <bool>,
-    "objectivity": <bool>,
-    "persuasion": <bool>,
-    "active_listening": <bool>,
-    "objection_handling": <bool>
+    "clarity": <float>,
+    "objectivity": <float>,
+    "persuasion": <float>,
+    "active_listening": <float>,
+    "objection_handling": <float>
   },
   "sentiment": {
-    "client": <bool>,
-    "team": <bool>,
-    "positivity": <bool>,
-    "negativity": <bool>
+    "client": <float>,
+    "team": <float>,
+    "positivity": <float>,
+    "negativity": <float>
   },
   "customer": {
-    "satisfaction": <bool>,
-    "trust": <bool>,
-    "engagement_level": <bool>,
-    "pain_understanding": <bool>,
-    "solution_fit": <bool>
+    "satisfaction": <float>,
+    "trust": <float>,
+    "engagement_level": <float>,
+    "pain_understanding": <float>,
+    "solution_fit": <float>
   },
   "business": {
-    "deal_progress": <bool>,
-    "conversion_likelihood": <bool>,
-    "perceived_value": <bool>,
-    "expected_value": <bool>,
-    "urgency": <bool>
+    "deal_progress": <float>,
+    "conversion_likelihood": <float>,
+    "perceived_value": <float>,
+    "expected_value": <float>,
+    "urgency": <float>
   },
   "execution": {
-    "time_management": <bool>,
-    "agenda_adherence": <bool>,
-    "next_steps_clarity": <bool>,
-    "follow_up_quality": <bool>
+    "time_management": <float>,
+    "agenda_adherence": <float>,
+    "next_steps_clarity": <float>,
+    "follow_up_quality": <float>
   },
   "risk": {
-    "churn": <bool>,
-    "deal_loss": <bool>,
-    "objection": <bool>,
-    "disengagement": <bool>
+    "churn": <float>,
+    "deal_loss": <float>,
+    "objection": <float>,
+    "disengagement": <float>
   },
   "intelligence": {
-    "alignment": <bool>,
-    "buying_signal": <bool>,
-    "decision_momentum": <bool>,
-    "stakeholder_influence": <bool>
+    "alignment": <float>,
+    "buying_signal": <float>,
+    "decision_momentum": <float>,
+    "stakeholder_influence": <float>
   },
   "summary_scores": {
-    "overall_score": <bool>,
-    "client_health": <bool>,
-    "deal_health": <bool>
+    "overall_score": <float>,
+    "client_health": <float>,
+    "deal_health": <float>
   }
 }
 `
@@ -320,7 +329,7 @@ function checkRateLimit(userId) {
  * Lança erro em caso de falha na API.
  */
 async function callOpenRouter(systemPrompt, userMessage, maxTokens) {
-    const model = optEnv('OPENROUTER_MODEL', 'google/gemini-2.0-flash-001')
+    const model = optEnv('OPENROUTER_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b:free')
 
     const response = await fetch(OPENROUTER_URL, {
         method: 'POST',
@@ -387,7 +396,8 @@ function parseAndValidateScores(rawText) {
         for (const key of Object.keys(defaults)) {
             const val = received[key]
             if (typeof val === 'number' && Number.isFinite(val)) {
-                result[key] = Math.min(100, Math.max(0, Math.round(val)))
+                const clamped = Math.min(100, Math.max(0, val))
+                result[key] = Math.round(clamped * 10) / 10   // preserva 1 casa decimal
             } else {
                 result[key] = defaults[key]   // fallback para 0 se ausente ou inválido
             }
@@ -481,10 +491,9 @@ async function dbListAnalyses(userId, page, pageSize) {
     const from = (page - 1) * pageSize
     const to = from + pageSize - 1
 
-    // A lista não traz `transcription` (potencialmente grande) — apenas metadados leves
     const { data, error, count } = await supabase
         .from('meetings')
-        .select('id, title, size, goal, created_at', { count: 'exact' })
+        .select('id, title, size, goal, transcription, created_at', { count: 'exact' })
         .eq('user_id', userId)
         .order('created_at', { ascending: false })
         .range(from, to)
