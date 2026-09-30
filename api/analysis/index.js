@@ -14,24 +14,24 @@
  * ─────────────────────────────────────────────────────────────────
  *  OPENROUTER_API_KEY        Chave de API do OpenRouter (obrigatória)
  *  OPENROUTER_MODEL          Modelo a usar (padrão: nvidia/nemotron-3-ultra-550b-a55b:free)
- *  OPENROUTER_MAX_TOKENS     Tokens máximos do relatório (padrão: 3584)
+ *  OPENROUTER_MAX_TOKENS     Tokens máximos do relatório (padrão: 3072)
  *  SUPABASE_URL              URL do projeto Supabase (obrigatória)
  *  SUPABASE_SERVICE_ROLE_KEY Chave service role do Supabase (obrigatória)
  *  JWT_SECRET                Segredo para verificação do JWT de sessão (obrigatória)
  *
  * Notas desta revisão
  * ─────────────────────────────────────────────────────────────────
- *  • O relatório narrativo é gerado como Markdown pronto para PDF e os scores
- *    como JSON, em duas chamadas paralelas (Promise.allSettled).
- *  • Campos persistidos e retornados: `size`, `goal` e `transcription`.
- *  • Tolerância a modelos de raciocínio: raciocínio suprimido na chamada,
- *    blocos <think> removidos e JSON de scores extraído por varredura de chaves
- *    balanceadas, com nova tentativa automática.
- *  • Retry em falhas transitórias, validação de UUID, limpeza do rate limit em
- *    memória e exclusão em uma única query.
+ *  • O relatório narrativo agora é gerado como JSON estruturado (mais compacto,
+ *    mais rápido de gerar e mais fácil de renderizar/exportar para PDF depois).
+ *  • As duas chamadas ao modelo (relatório + scores) rodam em paralelo
+ *    (Promise.allSettled), reduzindo a latência total quase pela metade.
+ *  • Novos campos persistidos e retornados: `size` (tamanho da transcrição),
+ *    `goal` (cumprimento do objetivo da reunião) e `transcription` (transcrição
+ *    original, preservada integralmente).
+ *  • Scores: o JSON é extraído da resposta mesmo com texto/raciocínio ao redor,
+ *    com orçamento de tokens maior e uma nova tentativa automática.
  */
 
-import { randomUUID } from 'node:crypto'
 import { supabase } from '../_lib/supabase.js'
 import { getUserId } from '../_lib/auth.js'
 import { applyCors } from '../_cors.js'
@@ -45,15 +45,11 @@ const PAGE_SIZE_DEFAULT = 20
 const PAGE_SIZE_MAX = 50
 const SCORES_MAX_TOKENS = 4096
 const SCORES_MAX_ATTEMPTS = 2
-const NARRATIVE_MAX_ATTEMPTS = 2
-const TRANSIENT_STATUS = new Set([408, 429, 500, 502, 503, 504])
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 // Rate limit em memória por userId (evita sobrecarga e custo excessivo de API)
 const _rlMap = new Map()
 const RL_WINDOW_MS = 60_000   // janela de 1 minuto
 const RL_MAX_REQS = 10       // análises são pesadas — limite conservador
-const RL_CLEANUP_THRESHOLD = 500
 
 const VALID_GOALS = new Set(['success', 'partial', 'fail'])
 
@@ -276,11 +272,6 @@ function optEnv(key, fallback = '') {
     return process.env[key] ?? fallback
 }
 
-function optEnvInt(key, fallback) {
-    const n = parseInt(optEnv(key, ''), 10)
-    return Number.isFinite(n) && n > 0 ? n : fallback
-}
-
 /** Remove null bytes e caracteres de controle (preserva espaço, tab, newline) */
 function sanitize(str, maxLen = MAX_TRANSCRIPT_LEN) {
     if (typeof str !== 'string') return ''
@@ -289,15 +280,6 @@ function sanitize(str, maxLen = MAX_TRANSCRIPT_LEN) {
         .replace(/[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
         .slice(0, maxLen)
         .trim()
-}
-
-/** Trecho curto e em linha única para logs — evita despejar conteúdo do modelo/transcrição */
-function logSnippet(str, maxLen = 120) {
-    return String(str ?? '').replace(/\s+/g, ' ').slice(0, maxLen)
-}
-
-function isValidUuid(value) {
-    return typeof value === 'string' && UUID_REGEX.test(value)
 }
 
 function applySecurityHeaders(res) {
@@ -329,13 +311,6 @@ function formatSize(bytes) {
 
 function checkRateLimit(userId) {
     const now = Date.now()
-
-    if (_rlMap.size > RL_CLEANUP_THRESHOLD) {
-        for (const [key, value] of _rlMap) {
-            if (now > value.resetAt) _rlMap.delete(key)
-        }
-    }
-
     let entry = _rlMap.get(userId)
 
     if (!entry || now > entry.resetAt) {
@@ -353,72 +328,45 @@ function checkRateLimit(userId) {
 
 // ─── Chamada ao OpenRouter (modo não-streaming) ───────────────────────────────
 
-/** Remove blocos de raciocínio (<think>...</think>) que modelos de reasoning podem vazar no content */
-function stripThinking(rawText) {
-    return rawText
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .replace(/^[\s\S]*<\/think>/i, '')
-        .trim()
-}
-
 /**
  * Envia uma mensagem ao OpenRouter e aguarda a resposta completa.
- * Lança erro em caso de falha na API; `err.transient` indica se vale repetir.
+ * Lança erro em caso de falha na API.
  */
-async function callOpenRouter(systemPrompt, userMessage, maxTokens, { json = false } = {}) {
+async function callOpenRouter(systemPrompt, userMessage, maxTokens) {
     const model = optEnv('OPENROUTER_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b:free')
 
-    let response
-    try {
-        response = await fetch(OPENROUTER_URL, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${requireEnv('OPENROUTER_API_KEY')}`,
-                'Content-Type': 'application/json',
-                'X-Title': 'MeetingAnalyzer',
-            },
-            body: JSON.stringify({
-                model,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userMessage },
-                ],
-                stream: false,
-                max_tokens: maxTokens,
-                temperature: 0.2,   // análises requerem consistência e fidelidade ao dado
-                reasoning: { effort: 'low', exclude: true },
-                ...(json ? { response_format: { type: 'json_object' } } : {}),
-            }),
-        })
-    } catch (err) {
-        if (err instanceof TypeError) err.transient = true   // falha de rede
-        throw err
-    }
+    const response = await fetch(OPENROUTER_URL, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${requireEnv('OPENROUTER_API_KEY')}`,
+            'Content-Type': 'application/json',
+            'X-Title': 'MeetingAnalyzer',
+        },
+        body: JSON.stringify({
+            model,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userMessage },
+            ],
+            stream: false,
+            max_tokens: maxTokens,
+            temperature: 0.2,   // análises requerem consistência e fidelidade ao dado
+        }),
+    })
 
     if (!response.ok) {
-        const body = await response.text().catch(() => '')
-        const err = new Error(`OpenRouter ${response.status}: ${logSnippet(body, 300)}`)
-        err.transient = TRANSIENT_STATUS.has(response.status)
-        throw err
+        const body = await response.text().catch(() => '(sem corpo)')
+        throw new Error(`OpenRouter ${response.status}: ${body}`)
     }
 
     const data = await response.json()
     const content = data?.choices?.[0]?.message?.content
 
     if (typeof content !== 'string' || !content.trim()) {
-        const err = new Error('OpenRouter retornou uma resposta vazia ou inválida.')
-        err.transient = true
-        throw err
+        throw new Error('OpenRouter retornou uma resposta vazia ou inválida.')
     }
 
-    const cleaned = stripThinking(content)
-    if (!cleaned) {
-        const err = new Error('OpenRouter retornou apenas raciocínio, sem conteúdo utilizável.')
-        err.transient = true
-        throw err
-    }
-
-    return cleaned
+    return content.trim()
 }
 
 /** Remove blocos de código Markdown (```json ... ```) que o modelo às vezes adiciona */
@@ -429,13 +377,16 @@ function stripCodeFence(rawText) {
         .trim()
 }
 
+// ─── Parsing e Validação do JSON de Scores ────────────────────────────────────
+
 /**
- * Localiza o objeto JSON de scores em um texto que pode conter prosa antes ou
- * depois. Varre chaves balanceadas (ignorando chaves dentro de strings) e
- * retorna o último objeto parseável que contenha ao menos uma seção do schema.
+ * Localiza o objeto JSON de scores dentro da resposta, ignorando qualquer texto
+ * (raciocínio, comentários, blocos <think> ou code fences) antes ou depois dele.
+ * Varre chaves balanceadas respeitando strings e devolve o último objeto
+ * parseável que contenha ao menos uma seção do schema.
  */
 function extractJsonObject(rawText) {
-    const text = stripCodeFence(stripThinking(rawText))
+    const text = stripCodeFence(rawText.replace(/<think>[\s\S]*?<\/think>/gi, ''))
     const sections = Object.keys(DEFAULT_ANALYSIS_DATA)
     const candidates = []
 
@@ -482,8 +433,6 @@ function extractJsonObject(rawText) {
     return null
 }
 
-// ─── Parsing e Validação do JSON de Scores ────────────────────────────────────
-
 /**
  * Extrai e valida o JSON de scores retornado pelo modelo.
  * Garante que todos os campos existam e sejam números 0-100 com uma casa decimal.
@@ -492,7 +441,7 @@ function parseAndValidateScores(rawText) {
     const parsed = extractJsonObject(rawText)
 
     if (!parsed) {
-        throw new Error(`JSON de scores não encontrado na resposta. Raw: ${logSnippet(rawText)}`)
+        throw new Error(`JSON de scores não encontrado na resposta. Raw: ${rawText.slice(0, 200)}`)
     }
 
     // Valida e normaliza cada valor recursivamente contra o schema padrão
@@ -523,39 +472,15 @@ function parseAndValidateScores(rawText) {
 }
 
 /**
- * Gera o relatório narrativo, repetindo a chamada apenas em falhas transitórias.
- */
-async function generateNarrative(userPrompt, maxTokens) {
-    let lastError
-
-    for (let attempt = 1; attempt <= NARRATIVE_MAX_ATTEMPTS; attempt++) {
-        try {
-            return await callOpenRouter(SYSTEM_PROMPT_ANALYSIS, userPrompt, maxTokens)
-        } catch (err) {
-            lastError = err
-            console.warn(`[analyze] Relatório — tentativa ${attempt}/${NARRATIVE_MAX_ATTEMPTS} falhou:`, err.message)
-            if (!err.transient) break
-        }
-    }
-
-    throw lastError
-}
-
-/**
- * Gera e valida os scores, repetindo a chamada quando a API falha ou o modelo
- * não devolve um JSON utilizável. Lança o último erro se todas as tentativas falharem.
+ * Gera e valida os scores. Se a chamada falhar ou a resposta não contiver um
+ * JSON utilizável, tenta novamente antes de desistir.
  */
 async function generateScores(userPrompt) {
     let lastError
 
     for (let attempt = 1; attempt <= SCORES_MAX_ATTEMPTS; attempt++) {
         try {
-            const raw = await callOpenRouter(
-                SYSTEM_PROMPT_SCORES,
-                userPrompt,
-                SCORES_MAX_TOKENS,
-                { json: true },
-            )
+            const raw = await callOpenRouter(SYSTEM_PROMPT_SCORES, userPrompt, SCORES_MAX_TOKENS)
             return parseAndValidateScores(raw)
         } catch (err) {
             lastError = err
@@ -652,17 +577,14 @@ async function dbListAnalyses(userId, page, pageSize) {
     return { analyses: data, total: count }
 }
 
-/** Remove a análise em uma única query; retorna true se algo foi removido */
 async function dbDeleteAnalysis(userId, meetingId) {
-    const { data, error } = await supabase
+    const { error } = await supabase
         .from('meetings')
         .delete()
         .eq('id', meetingId)
         .eq('user_id', userId)   // ← ownership check
-        .select('id')
 
     if (error) throw new Error(`Supabase delete: ${error.message}`)
-    return Array.isArray(data) && data.length > 0
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -685,8 +607,7 @@ async function dbDeleteAnalysis(userId, meetingId) {
  *   "size":          "14.2 KB",
  *   "goal":          "success" | "partial" | "fail",
  *   "transcription": { ... transcrição original ... },
- *   "created_at":    "ISO 8601",
- *   "warning":       "string (apenas quando houver falha parcial)"
+ *   "created_at":    "ISO 8601"
  * }
  */
 async function handleAnalyze(req, res, userId) {
@@ -704,7 +625,7 @@ async function handleAnalyze(req, res, userId) {
         return sendError(res, 400, 'O campo "transcript" é obrigatório e deve ser um objeto JSON.')
     }
 
-    const meetingId = randomUUID()
+    const meetingId = crypto.randomUUID()
     const rawTitle = sanitize(body.title ?? '', MAX_TITLE_LEN)
 
     // Converte o JSON de transcrição em texto para o modelo
@@ -719,14 +640,14 @@ async function handleAnalyze(req, res, userId) {
     // Relatório em Markdown enxuto (sem repetição entre seções) — teto de tokens
     // moderado, suficiente para a tabela de métricas e as seções concisas, sem
     // abrir espaço para prolixidade.
-    const maxTokensAnalysis = optEnvInt('OPENROUTER_MAX_TOKENS', 3584)
+    const maxTokensAnalysis = parseInt(optEnv('OPENROUTER_MAX_TOKENS', '3584'), 10)
 
     // ── Prompt de usuário compartilhado ──────────────────────────────────────
     const userPrompt = `TRANSCRIÇÃO DA REUNIÃO:\n\n${transcriptSafe}`
 
     // ── Chamadas ao modelo em PARALELO (ganho de latência) ────────────────────
     const [analysisSettled, scoresSettled] = await Promise.allSettled([
-        generateNarrative(userPrompt, maxTokensAnalysis),
+        callOpenRouter(SYSTEM_PROMPT_ANALYSIS, userPrompt, maxTokensAnalysis),
         generateScores(userPrompt),
     ])
 
@@ -748,14 +669,12 @@ async function handleAnalyze(req, res, userId) {
     }
 
     // Scores são um complemento quantitativo — falha não aborta a requisição
-    const warnings = []
     let analysisData
     if (scoresSettled.status === 'fulfilled') {
         analysisData = scoresSettled.value
     } else {
         console.error('[analyze] Erro ao gerar scores (usando defaults):', scoresSettled.reason?.message)
-        analysisData = structuredClone(DEFAULT_ANALYSIS_DATA)
-        warnings.push('Não foi possível calcular as métricas numéricas; os valores retornados são padrões (0.0) e não representam medições.')
+        analysisData = { ...DEFAULT_ANALYSIS_DATA }
     }
 
     // ── Deriva título automático se não fornecido ──────────────────────────────
@@ -772,7 +691,6 @@ async function handleAnalyze(req, res, userId) {
     } catch (err) {
         console.error('[analyze] Erro ao salvar no Supabase:', err.message)
         // Retorna a análise mesmo sem persistência — o cliente ainda recebe o resultado
-        warnings.push('Análise gerada com sucesso, mas houve falha ao persistir no banco de dados.')
         return res.status(200).json({
             id: meetingId,
             title: finalTitle,
@@ -782,7 +700,7 @@ async function handleAnalyze(req, res, userId) {
             goal,
             transcription: body.transcript,
             created_at: new Date().toISOString(),
-            warning: warnings.join(' '),
+            warning: 'Análise gerada com sucesso, mas houve falha ao persistir no banco de dados.',
         })
     }
 
@@ -795,7 +713,6 @@ async function handleAnalyze(req, res, userId) {
         goal,
         transcription: body.transcript,
         created_at: savedRecord?.created_at ?? new Date().toISOString(),
-        ...(warnings.length ? { warning: warnings.join(' ') } : {}),
     })
 }
 
@@ -831,7 +748,6 @@ function deriveTitle(transcript) {
 async function handleGet(req, res, userId) {
     const { id } = req.query
     if (!id) return sendError(res, 400, 'Parâmetro "id" é obrigatório.')
-    if (!isValidUuid(id)) return sendError(res, 400, 'Parâmetro "id" inválido.')
 
     const record = await dbGetAnalysis(userId, id)
     if (!record) return sendError(res, 404, 'Análise não encontrada.')
@@ -841,13 +757,9 @@ async function handleGet(req, res, userId) {
 
 /** GET ?action=list */
 async function handleList(req, res, userId) {
-    const rawPage = parseInt(req.query.page ?? '1', 10)
-    const rawPageSize = parseInt(req.query.page_size ?? String(PAGE_SIZE_DEFAULT), 10)
-
-    const page = Number.isFinite(rawPage) ? Math.max(1, rawPage) : 1
-    const pageSize = Number.isFinite(rawPageSize)
-        ? Math.min(PAGE_SIZE_MAX, Math.max(1, rawPageSize))
-        : PAGE_SIZE_DEFAULT
+    const page = Math.max(1, parseInt(req.query.page ?? '1', 10))
+    const pageSize = Math.min(PAGE_SIZE_MAX,
+        Math.max(1, parseInt(req.query.page_size ?? String(PAGE_SIZE_DEFAULT), 10)))
 
     const result = await dbListAnalyses(userId, page, pageSize)
     return res.status(200).json({ ...result, page, page_size: pageSize })
@@ -857,12 +769,12 @@ async function handleList(req, res, userId) {
 async function handleDelete(req, res, userId) {
     const { id } = req.query
     if (!id) return sendError(res, 400, 'Parâmetro "id" é obrigatório.')
-    if (!isValidUuid(id)) return sendError(res, 400, 'Parâmetro "id" inválido.')
 
-    // Ownership garantido na própria query de exclusão
-    const deleted = await dbDeleteAnalysis(userId, id)
-    if (!deleted) return sendError(res, 404, 'Análise não encontrada.')
+    // Verifica ownership antes de deletar
+    const record = await dbGetAnalysis(userId, id)
+    if (!record) return sendError(res, 404, 'Análise não encontrada.')
 
+    await dbDeleteAnalysis(userId, id)
     return res.status(200).json({ success: true })
 }
 
@@ -899,10 +811,10 @@ export default async function handler(req, res) {
                 return await handleDelete(req, res, userId)
 
             default:
-                return sendError(res, 400, `Ação desconhecida: "${logSnippet(action, 40)}".`)
+                return sendError(res, 400, `Ação desconhecida: "${action}".`)
         }
     } catch (err) {
-        console.error(`[analyze/${logSnippet(action, 20)}] Erro inesperado:`, err.message)
+        console.error(`[analyze/${action}] Erro inesperado:`, err.message)
         // Nunca expõe stack trace ao cliente
         return sendError(res, 500, 'Erro interno do servidor.')
     }
