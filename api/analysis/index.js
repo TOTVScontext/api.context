@@ -15,7 +15,6 @@
  *  OPENROUTER_API_KEY        Chave de API do OpenRouter (obrigatória)
  *  OPENROUTER_MODEL          Modelo a usar (padrão: nvidia/nemotron-3-ultra-550b-a55b:free)
  *  OPENROUTER_MAX_TOKENS     Tokens máximos do relatório (padrão: 3584)
- *  OPENROUTER_TIMEOUT_MS     Timeout por chamada ao modelo (padrão: 40000)
  *  SUPABASE_URL              URL do projeto Supabase (obrigatória)
  *  SUPABASE_SERVICE_ROLE_KEY Chave service role do Supabase (obrigatória)
  *  JWT_SECRET                Segredo para verificação do JWT de sessão (obrigatória)
@@ -28,8 +27,8 @@
  *  • Tolerância a modelos de raciocínio: raciocínio suprimido na chamada,
  *    blocos <think> removidos e JSON de scores extraído por varredura de chaves
  *    balanceadas, com nova tentativa automática.
- *  • Timeout por chamada, retry em falhas transitórias, validação de UUID,
- *    limpeza do rate limit em memória e exclusão em uma única query.
+ *  • Retry em falhas transitórias, validação de UUID, limpeza do rate limit em
+ *    memória e exclusão em uma única query.
  */
 
 import { randomUUID } from 'node:crypto'
@@ -47,7 +46,6 @@ const PAGE_SIZE_MAX = 50
 const SCORES_MAX_TOKENS = 4096
 const SCORES_MAX_ATTEMPTS = 2
 const NARRATIVE_MAX_ATTEMPTS = 2
-const REQUEST_TIMEOUT_DEFAULT_MS = 40_000
 const TRANSIENT_STATUS = new Set([408, 429, 500, 502, 503, 504])
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -369,15 +367,11 @@ function stripThinking(rawText) {
  */
 async function callOpenRouter(systemPrompt, userMessage, maxTokens, { json = false } = {}) {
     const model = optEnv('OPENROUTER_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b:free')
-    const timeoutMs = optEnvInt('OPENROUTER_TIMEOUT_MS', REQUEST_TIMEOUT_DEFAULT_MS)
 
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
-
+    let response
     try {
-        const response = await fetch(OPENROUTER_URL, {
+        response = await fetch(OPENROUTER_URL, {
             method: 'POST',
-            signal: controller.signal,
             headers: {
                 'Authorization': `Bearer ${requireEnv('OPENROUTER_API_KEY')}`,
                 'Content-Type': 'application/json',
@@ -396,42 +390,35 @@ async function callOpenRouter(systemPrompt, userMessage, maxTokens, { json = fal
                 ...(json ? { response_format: { type: 'json_object' } } : {}),
             }),
         })
-
-        if (!response.ok) {
-            const body = await response.text().catch(() => '')
-            const err = new Error(`OpenRouter ${response.status}: ${logSnippet(body, 300)}`)
-            err.transient = TRANSIENT_STATUS.has(response.status)
-            throw err
-        }
-
-        const data = await response.json()
-        const content = data?.choices?.[0]?.message?.content
-
-        if (typeof content !== 'string' || !content.trim()) {
-            const err = new Error('OpenRouter retornou uma resposta vazia ou inválida.')
-            err.transient = true
-            throw err
-        }
-
-        const cleaned = stripThinking(content)
-        if (!cleaned) {
-            const err = new Error('OpenRouter retornou apenas raciocínio, sem conteúdo utilizável.')
-            err.transient = true
-            throw err
-        }
-
-        return cleaned
     } catch (err) {
-        if (err?.name === 'AbortError') {
-            const timeoutErr = new Error(`OpenRouter timeout após ${timeoutMs}ms`)
-            timeoutErr.transient = true
-            throw timeoutErr
-        }
         if (err instanceof TypeError) err.transient = true   // falha de rede
         throw err
-    } finally {
-        clearTimeout(timer)
     }
+
+    if (!response.ok) {
+        const body = await response.text().catch(() => '')
+        const err = new Error(`OpenRouter ${response.status}: ${logSnippet(body, 300)}`)
+        err.transient = TRANSIENT_STATUS.has(response.status)
+        throw err
+    }
+
+    const data = await response.json()
+    const content = data?.choices?.[0]?.message?.content
+
+    if (typeof content !== 'string' || !content.trim()) {
+        const err = new Error('OpenRouter retornou uma resposta vazia ou inválida.')
+        err.transient = true
+        throw err
+    }
+
+    const cleaned = stripThinking(content)
+    if (!cleaned) {
+        const err = new Error('OpenRouter retornou apenas raciocínio, sem conteúdo utilizável.')
+        err.transient = true
+        throw err
+    }
+
+    return cleaned
 }
 
 /** Remove blocos de código Markdown (```json ... ```) que o modelo às vezes adiciona */
