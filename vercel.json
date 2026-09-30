@@ -1,0 +1,14 @@
+{
+    "$schema": "https://openapi.vercel.sh/vercel.json",
+    "crons": [
+        {
+            "path": "/api/dashboard",
+            "schedule": "0 11 * * 1"
+        }
+    ],
+    "functions": {
+        "api/dashboard/index.js": {
+            "maxDuration": 300
+        }
+    }
+}
