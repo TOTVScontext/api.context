@@ -22,7 +22,7 @@
  * Variáveis de ambiente
  *  OPENROUTER_API_KEY         obrigatória
  *  OPENROUTER_MODEL           um modelo ou lista separada por vírgula (fallback em ordem)
- *  DASHBOARD_MAX_TOKENS       padrão 8192 (modelos com raciocínio consomem parte)
+ *  DASHBOARD_MAX_TOKENS       padrão 16384 (modelos com raciocínio gastam parte do limite pensando)
  *  SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / JWT_SECRET / CRON_SECRET   obrigatórias
  */
 
@@ -35,10 +35,13 @@ import { applyCors } from '../_cors.js'
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
 const DEFAULT_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free'
-const OPENROUTER_TIMEOUT_MS = 60_000
-const REPORT_BUDGET_MS = 120_000
+const OPENROUTER_TIMEOUT_MS = 90_000
+const REPORT_BUDGET_MS = 150_000
+const DEFAULT_MAX_TOKENS = 16_384
 const ATTEMPTS_PER_MODEL = 2
-const NON_RETRYABLE_STATUS = new Set([400, 401, 402, 403, 404])
+const NON_RETRYABLE_STATUS = new Set([401, 402, 403, 404])
+const BACKOFF_DEFAULT_S = 3
+const BACKOFF_MAX_S = 10
 
 const PAGE_SIZE = 1000
 const TIMELINE_MAX_WEEKS = 12
@@ -359,7 +362,10 @@ function extractContent(message) {
     return typeof text === 'string' ? text.trim() : ''
 }
 
-async function callOpenRouter(model, userMessage, maxTokens, timeoutMs) {
+const failure = (message, reason, extra = {}) => Object.assign(new Error(message), { reason, ...extra })
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+async function callOpenRouter(model, userMessage, { maxTokens, timeoutMs, withReasoning }) {
     const response = await fetch(OPENROUTER_URL, {
         method: 'POST',
         headers: {
@@ -376,29 +382,31 @@ async function callOpenRouter(model, userMessage, maxTokens, timeoutMs) {
             stream: false,
             max_tokens: maxTokens,
             temperature: 0.2,
+            ...(withReasoning && { reasoning: { effort: 'low' } }),
         }),
         signal: AbortSignal.timeout(timeoutMs),
     })
 
     if (!response.ok) {
         const body = await response.text().catch(() => '(sem corpo)')
-        throw Object.assign(new Error(`OpenRouter ${response.status} (${model}): ${body.slice(0, 500)}`), { status: response.status })
+        const retryAfter = Number(response.headers.get('Retry-After')) || undefined
+        throw failure(`OpenRouter ${response.status} (${model}): ${body.slice(0, 500)}`, `http_${response.status}`, { status: response.status, retryAfter })
     }
 
     const data = await response.json()
     if (data?.error) {
         const status = Number(data.error.code) || undefined
-        throw Object.assign(new Error(`OpenRouter erro (${model}): ${data.error.message ?? JSON.stringify(data.error)}`), { status })
+        throw failure(`OpenRouter erro (${model}): ${data.error.message ?? JSON.stringify(data.error)}`, `http_${status ?? 'erro'}`, { status })
     }
 
     const choice = data?.choices?.[0]
     if (choice?.finish_reason === 'length') {
-        throw new Error(`Resposta truncada (${model}): aumente DASHBOARD_MAX_TOKENS.`)
+        throw failure(`Resposta truncada (${model}): aumente DASHBOARD_MAX_TOKENS.`, 'truncated')
     }
 
     const content = extractContent(choice?.message)
     if (!content) {
-        throw new Error(`Resposta vazia (${model}, finish_reason: ${choice?.finish_reason ?? 'n/d'}).`)
+        throw failure(`Resposta vazia (${model}, finish_reason: ${choice?.finish_reason ?? 'n/d'}).`, 'empty')
     }
 
     return content
@@ -413,30 +421,46 @@ function cleanReport(rawText) {
         .trim()
 
     const start = text.search(/^# /m)
-    if (start === -1) throw new Error('O relatório retornado não contém o título principal (H1).')
+    if (start === -1) throw failure('O relatório retornado não contém o título principal (H1).', 'invalid_format')
 
     return text.slice(start).trim()
 }
 
 async function generateReport(analysisData) {
     const models = (process.env.OPENROUTER_MODEL || DEFAULT_MODEL).split(',').map(m => m.trim()).filter(Boolean)
-    const maxTokens = parseInt(process.env.DASHBOARD_MAX_TOKENS ?? '8192', 10) || 8192
+    const maxTokens = parseInt(process.env.DASHBOARD_MAX_TOKENS ?? '', 10) || DEFAULT_MAX_TOKENS
     const userPrompt = `MÉTRICAS CONSOLIDADAS DA EMPRESA:\n\n${JSON.stringify(analysisData, null, 2)}`
     const deadline = Date.now() + REPORT_BUDGET_MS
-    let lastError = new Error('Tempo esgotado antes da geração do relatório.')
+    let lastError = failure('Tempo esgotado antes da geração do relatório.', 'timeout')
 
     for (const model of models) {
+        let withReasoning = true
+
         for (let attempt = 1; attempt <= ATTEMPTS_PER_MODEL; attempt++) {
             const remaining = deadline - Date.now()
             if (remaining < 5_000) throw lastError
 
+            const startedAt = Date.now()
             try {
-                const raw = await callOpenRouter(model, userPrompt, maxTokens, Math.min(OPENROUTER_TIMEOUT_MS, remaining))
+                const raw = await callOpenRouter(model, userPrompt, {
+                    maxTokens,
+                    withReasoning,
+                    timeoutMs: Math.min(OPENROUTER_TIMEOUT_MS, remaining),
+                })
                 return cleanReport(raw)
             } catch (err) {
+                if (err.name === 'TimeoutError') err.reason = 'timeout'
                 lastError = err
-                console.warn(`[dashboard] ${model} — tentativa ${attempt}/${ATTEMPTS_PER_MODEL} falhou:`, err.message)
-                if (NON_RETRYABLE_STATUS.has(err.status)) break
+                console.warn(`[dashboard] ${model} — tentativa ${attempt}/${ATTEMPTS_PER_MODEL} falhou em ${Date.now() - startedAt}ms [${err.reason ?? 'unknown'}]:`, err.message)
+
+                if (err.status === 400 && withReasoning) {
+                    withReasoning = false
+                    continue
+                }
+                if (NON_RETRYABLE_STATUS.has(err.status) || err.status === 400) break
+
+                const backoffMs = Math.min(err.retryAfter ?? BACKOFF_DEFAULT_S, BACKOFF_MAX_S) * 1000
+                if (attempt < ATTEMPTS_PER_MODEL && deadline - Date.now() > backoffMs + 5_000) await sleep(backoffMs)
             }
         }
     }
@@ -482,8 +506,8 @@ async function runAnalysis(userId, trigger) {
         try {
             report = await generateReport(analysisData)
         } catch (err) {
-            console.error(`[dashboard] Falha ao gerar relatório (user ${userId}):`, err.message)
-            return { status: 'generation_failed' }
+            console.error(`[dashboard] Falha ao gerar relatório (user ${userId}) [${err.reason ?? 'unknown'}]:`, err.message)
+            return { status: 'generation_failed', reason: err.reason ?? 'unknown' }
         }
 
         return { status: 'completed', record: await dbSaveDashboard(userId, report, analysisData) }
@@ -503,7 +527,7 @@ async function handleGet(res, userId) {
  * POST ?action=generate
  * 200 completed:  { status, id, performance_rate, total_analyses, created_at }
  * 200 up_to_date: { status, id, created_at, message }
- * Erros: 409 (em andamento) | 422 (sem métricas) | 502 (falha do modelo)
+ * Erros: 409 (em andamento) | 422 (sem métricas) | 502 (falha do modelo; `reason` indica a causa)
  */
 async function handleGenerate(res, userId) {
     const result = await runAnalysis(userId, 'manual')
@@ -527,7 +551,7 @@ async function handleGenerate(res, userId) {
             return sendError(res, 409, 'Já existe uma análise geral em andamento.')
 
         default:
-            return sendError(res, 502, 'Falha ao gerar a análise geral. Tente novamente.')
+            return res.status(502).json({ error: 'Falha ao gerar a análise geral. Tente novamente.', reason: result.reason })
     }
 }
 
