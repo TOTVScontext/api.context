@@ -7,6 +7,7 @@
  * desempenho geral (métricas em JSON + relatório em Markdown) persistido em `dashboard`.
  *
  * Rotas
+ *  GET   ?action=get        Último snapshot do usuário autenticado ({ dashboard } ou { dashboard: null })
  *  POST  ?action=generate   Geração manual (usuário autenticado)
  *  GET   ?action=cron       Execução semanal para todos os usuários (Vercel Cron)
  *
@@ -48,6 +49,10 @@ const CRON_CONCURRENCY = 3
 const CRON_TIME_BUDGET_MS = 120_000
 
 const VALID_GOALS = ['success', 'partial', 'fail']
+const DASHBOARD_COLUMNS = 'id, analysis, analysis_data, performance_rate, total_analyses, created_at'
+
+// O backend de análises pode gravar "failure"; o snapshot usa "fail"
+const normalizeGoal = goal => (goal === 'failure' ? 'fail' : goal)
 
 const METRIC_SCHEMA = {
     meeting_analysis: ['effectiveness', 'productivity', 'goal_achievement', 'decision_quality'],
@@ -161,11 +166,12 @@ async function fetchAll(table, build) {
     }
 }
 
-const dbFetchMeetings = userId => fetchAll('meetings', q => q
+const dbFetchMeetings = async userId => (await fetchAll('meetings', q => q
     .select('id, title, goal, analysis_data, created_at')
     .eq('user_id', userId)
     .order('created_at', { ascending: true })
-    .order('id', { ascending: true }))
+    .order('id', { ascending: true })))
+    .map(meeting => ({ ...meeting, goal: normalizeGoal(meeting.goal) }))
 
 const dbListUserIds = async () =>
     (await fetchAll('users', q => q.select('id').order('id', { ascending: true }))).map(u => u.id)
@@ -184,10 +190,10 @@ async function dbGetLastMeetingDate(userId) {
     return data?.created_at ?? null
 }
 
-async function dbGetLatestDashboard(userId) {
+async function dbGetLatestDashboard(userId, columns = 'id, analysis_data, created_at') {
     const { data, error } = await supabase
         .from('dashboard')
-        .select('id, analysis_data, created_at')
+        .select(columns)
         .eq('user_id', userId)
         .order('created_at', { ascending: false })
         .limit(1)
@@ -488,6 +494,11 @@ async function runAnalysis(userId, trigger) {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
+/** GET ?action=get — 200 { dashboard: {...} | null } */
+async function handleGet(res, userId) {
+    return res.status(200).json({ dashboard: await dbGetLatestDashboard(userId, DASHBOARD_COLUMNS) })
+}
+
 /**
  * POST ?action=generate
  * 200 completed:  { status, id, performance_rate, total_analyses, created_at }
@@ -589,13 +600,14 @@ export default async function handler(req, res) {
                 if (!isValidCronRequest(req)) return sendError(res, 401, 'Não autorizado.')
                 return await handleCron(res)
 
+            case 'get':
             case 'generate': {
-                if (req.method !== 'POST') return sendError(res, 405, 'Método não permitido.')
+                if (req.method !== (action === 'get' ? 'GET' : 'POST')) return sendError(res, 405, 'Método não permitido.')
 
                 const userId = getUserId(req)
                 if (!userId) return sendError(res, 401, 'Não autenticado.')
 
-                return await handleGenerate(res, userId)
+                return await (action === 'get' ? handleGet(res, userId) : handleGenerate(res, userId))
             }
 
             default:
