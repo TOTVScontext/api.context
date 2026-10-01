@@ -3,34 +3,26 @@
  * ========================
  * Análise Geral de Desempenho — Vercel Serverless Function (Node.js, ESM)
  *
- * Consolida as métricas de todas as análises (`meetings`) do usuário em um
- * snapshot de desempenho geral (métricas em JSON + relatório em Markdown) e o
- * persiste na tabela `dashboard`. A leitura pelo front é feita direto no banco.
+ * Consolida as métricas das análises (`meetings`) do usuário em um snapshot de
+ * desempenho geral (métricas em JSON + relatório em Markdown) persistido em `dashboard`.
  *
- * Rotas  →  ?action=<ação>
- * ─────────────────────────────────────────────────────────────────────────────
- *  POST   ?action=generate   Gera manualmente a análise geral (usuário autenticado)
- *  GET    ?action=cron       Execução semanal para todos os usuários (Vercel Cron)
+ * Rotas
+ *  POST  ?action=generate   Geração manual (usuário autenticado)
+ *  GET   ?action=cron       Execução semanal para todos os usuários (Vercel Cron)
  *
- * Tabela Supabase: `dashboard`
- *  id                uuid (PK)
- *  user_id           uuid
- *  analysis          text     (relatório em Markdown, pronto para PDF)
- *  analysis_data     jsonb    (métricas consolidadas)
- *  performance_rate  numeric  (% de variação da média geral vs. análise anterior;
- *                              100 quando não há análise anterior)
- *  total_analyses    numeric  (transcrições com métricas usadas na consolidação)
- *  created_at        timestamptz
+ * Regra de atualização: o snapshot só é regenerado quando existe ao menos uma
+ * transcrição posterior à última transcrição coberta pelo snapshot anterior.
+ * Sem novas transcrições (ex.: usuário inativo há semanas), nenhum modelo é chamado.
  *
- * Variáveis de Ambiente (Vercel → Settings → Environment Variables)
- * ─────────────────────────────────────────────────────────────────
- *  OPENROUTER_API_KEY        Chave de API do OpenRouter (obrigatória)
- *  OPENROUTER_MODEL          Modelo a usar (padrão: nvidia/nemotron-3-ultra-550b-a55b:free)
- *  DASHBOARD_MAX_TOKENS      Tokens máximos do relatório (padrão: 4096)
- *  SUPABASE_URL              URL do projeto Supabase (obrigatória)
- *  SUPABASE_SERVICE_ROLE_KEY Chave service role do Supabase (obrigatória)
- *  JWT_SECRET                Segredo para verificação do JWT de sessão (obrigatória)
- *  CRON_SECRET               Segredo enviado pela Vercel no header Authorization do cron (obrigatória)
+ * Tabela `dashboard`: id, user_id, analysis (md), analysis_data (jsonb),
+ *   performance_rate (variação % da média geral; 100 sem análise anterior),
+ *   total_analyses, created_at
+ *
+ * Variáveis de ambiente
+ *  OPENROUTER_API_KEY         obrigatória
+ *  OPENROUTER_MODEL           um modelo ou lista separada por vírgula (fallback em ordem)
+ *  DASHBOARD_MAX_TOKENS       padrão 8192 (modelos com raciocínio consomem parte)
+ *  SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / JWT_SECRET / CRON_SECRET   obrigatórias
  */
 
 import { timingSafeEqual } from 'node:crypto'
@@ -41,8 +33,11 @@ import { applyCors } from '../_cors.js'
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
-const OPENROUTER_TIMEOUT_MS = 75_000
-const REPORT_MAX_ATTEMPTS = 2
+const DEFAULT_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free'
+const OPENROUTER_TIMEOUT_MS = 60_000
+const REPORT_BUDGET_MS = 120_000
+const ATTEMPTS_PER_MODEL = 2
+const NON_RETRYABLE_STATUS = new Set([400, 401, 402, 403, 404])
 
 const PAGE_SIZE = 1000
 const TIMELINE_MAX_WEEKS = 12
@@ -50,11 +45,10 @@ const HIGHLIGHTS_COUNT = 3
 const TIMEZONE = 'America/Sao_Paulo'
 
 const CRON_CONCURRENCY = 3
-const CRON_TIME_BUDGET_MS = 120_000   // não inicia novos usuários após esse tempo (maxDuration = 300s)
+const CRON_TIME_BUDGET_MS = 120_000
 
 const VALID_GOALS = ['success', 'partial', 'fail']
 
-// Estrutura das métricas por reunião (`meetings.analysis_data`)
 const METRIC_SCHEMA = {
     meeting_analysis: ['effectiveness', 'productivity', 'goal_achievement', 'decision_quality'],
     engagement: ['overall', 'participation', 'interaction', 'attention'],
@@ -125,10 +119,6 @@ function requireEnv(key) {
     return v
 }
 
-function optEnv(key, fallback = '') {
-    return process.env[key] ?? fallback
-}
-
 function applySecurityHeaders(res) {
     res.setHeader('X-Content-Type-Options', 'nosniff')
     res.setHeader('X-Frame-Options', 'DENY')
@@ -159,24 +149,39 @@ function weekStart(isoDate) {
 
 // ─── Banco de Dados ───────────────────────────────────────────────────────────
 
-async function dbFetchMeetings(userId) {
-    const meetings = []
+/** Percorre todas as páginas de uma consulta; `build` recebe o query builder da tabela */
+async function fetchAll(table, build) {
+    const rows = []
 
     for (let from = 0; ; from += PAGE_SIZE) {
-        const { data, error } = await supabase
-            .from('meetings')
-            .select('id, title, goal, analysis_data, created_at')
-            .eq('user_id', userId)
-            .order('created_at', { ascending: true })
-            .order('id', { ascending: true })
-            .range(from, from + PAGE_SIZE - 1)
-
-        if (error) throw new Error(`Supabase meetings: ${error.message}`)
-        meetings.push(...data)
-        if (data.length < PAGE_SIZE) break
+        const { data, error } = await build(supabase.from(table)).range(from, from + PAGE_SIZE - 1)
+        if (error) throw new Error(`Supabase ${table}: ${error.message}`)
+        rows.push(...data)
+        if (data.length < PAGE_SIZE) return rows
     }
+}
 
-    return meetings
+const dbFetchMeetings = userId => fetchAll('meetings', q => q
+    .select('id, title, goal, analysis_data, created_at')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: true })
+    .order('id', { ascending: true }))
+
+const dbListUserIds = async () =>
+    (await fetchAll('users', q => q.select('id').order('id', { ascending: true }))).map(u => u.id)
+
+/** Data da transcrição mais recente do usuário (consulta leve, sem carregar métricas) */
+async function dbGetLastMeetingDate(userId) {
+    const { data, error } = await supabase
+        .from('meetings')
+        .select('created_at')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+    if (error) throw new Error(`Supabase meetings (última): ${error.message}`)
+    return data?.created_at ?? null
 }
 
 async function dbGetLatestDashboard(userId) {
@@ -192,39 +197,21 @@ async function dbGetLatestDashboard(userId) {
     return data
 }
 
-async function dbSaveDashboard(userId, analysis, analysisData, performanceRate, totalAnalyses) {
+async function dbSaveDashboard(userId, analysis, analysisData) {
     const { data, error } = await supabase
         .from('dashboard')
         .insert({
             user_id: userId,
             analysis,
             analysis_data: analysisData,
-            performance_rate: performanceRate,
-            total_analyses: totalAnalyses,
+            performance_rate: analysisData.overall.growth_rate,
+            total_analyses: analysisData.total_analyses,
         })
         .select('id, performance_rate, total_analyses, created_at')
         .single()
 
     if (error) throw new Error(`Supabase dashboard insert: ${error.message}`)
     return data
-}
-
-async function dbListUserIds() {
-    const ids = []
-
-    for (let from = 0; ; from += PAGE_SIZE) {
-        const { data, error } = await supabase
-            .from('users')
-            .select('id')
-            .order('id', { ascending: true })
-            .range(from, from + PAGE_SIZE - 1)
-
-        if (error) throw new Error(`Supabase users: ${error.message}`)
-        ids.push(...data.map(u => u.id))
-        if (data.length < PAGE_SIZE) break
-    }
-
-    return ids
 }
 
 // ─── Consolidação das Métricas ────────────────────────────────────────────────
@@ -234,6 +221,12 @@ function hasScores(data) {
     if (!data || typeof data !== 'object') return false
     return Object.entries(METRIC_SCHEMA).some(([section, keys]) =>
         keys.some(key => toScore(data[section]?.[key]) > 0))
+}
+
+/** O snapshot só precisa ser refeito se houver transcrição posterior à última coberta por ele */
+function hasNewMeetings(previous, lastMeetingAt) {
+    const covered = previous.analysis_data?.last_meeting_at ?? previous.created_at
+    return new Date(lastMeetingAt) > new Date(covered)
 }
 
 /** Variação percentual da média geral; 100 quando não há análise anterior comparável */
@@ -299,6 +292,7 @@ function summarizeMeeting(meeting) {
 /**
  * Consolida todas as análises com métricas em um único snapshot.
  * Retorna null quando nenhuma análise possui métricas utilizáveis.
+ * `meetings` deve estar ordenado por created_at crescente.
  */
 function buildAnalysisData(meetings, previousAverage, trigger) {
     const scored = meetings.filter(m => hasScores(m.analysis_data))
@@ -324,8 +318,9 @@ function buildAnalysisData(meetings, previousAverage, trigger) {
     const byOverall = [...scored].sort((a, b) => meetingOverall(b) - meetingOverall(a))
 
     return {
-        schema_version: 1,
+        schema_version: 2,
         generated_at: new Date().toISOString(),
+        last_meeting_at: meetings[meetings.length - 1].created_at,
         trigger,
         total_analyses: scored.length,
         excluded_without_scores: meetings.length - scored.length,
@@ -350,9 +345,15 @@ function buildAnalysisData(meetings, previousAverage, trigger) {
 
 // ─── Geração do Relatório (OpenRouter) ────────────────────────────────────────
 
-async function callOpenRouter(systemPrompt, userMessage, maxTokens) {
-    const model = optEnv('OPENROUTER_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b:free')
+function extractContent(message) {
+    const content = message?.content
+    const text = Array.isArray(content)
+        ? content.map(part => (typeof part === 'string' ? part : part?.text ?? '')).join('')
+        : content
+    return typeof text === 'string' ? text.trim() : ''
+}
 
+async function callOpenRouter(model, userMessage, maxTokens, timeoutMs) {
     const response = await fetch(OPENROUTER_URL, {
         method: 'POST',
         headers: {
@@ -363,29 +364,38 @@ async function callOpenRouter(systemPrompt, userMessage, maxTokens) {
         body: JSON.stringify({
             model,
             messages: [
-                { role: 'system', content: systemPrompt },
+                { role: 'system', content: SYSTEM_PROMPT_DASHBOARD },
                 { role: 'user', content: userMessage },
             ],
             stream: false,
             max_tokens: maxTokens,
             temperature: 0.2,
         }),
-        signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
     })
 
     if (!response.ok) {
         const body = await response.text().catch(() => '(sem corpo)')
-        throw new Error(`OpenRouter ${response.status}: ${body}`)
+        throw Object.assign(new Error(`OpenRouter ${response.status} (${model}): ${body.slice(0, 500)}`), { status: response.status })
     }
 
     const data = await response.json()
-    const content = data?.choices?.[0]?.message?.content
-
-    if (typeof content !== 'string' || !content.trim()) {
-        throw new Error('OpenRouter retornou uma resposta vazia ou inválida.')
+    if (data?.error) {
+        const status = Number(data.error.code) || undefined
+        throw Object.assign(new Error(`OpenRouter erro (${model}): ${data.error.message ?? JSON.stringify(data.error)}`), { status })
     }
 
-    return content.trim()
+    const choice = data?.choices?.[0]
+    if (choice?.finish_reason === 'length') {
+        throw new Error(`Resposta truncada (${model}): aumente DASHBOARD_MAX_TOKENS.`)
+    }
+
+    const content = extractContent(choice?.message)
+    if (!content) {
+        throw new Error(`Resposta vazia (${model}, finish_reason: ${choice?.finish_reason ?? 'n/d'}).`)
+    }
+
+    return content
 }
 
 /** Remove raciocínio (<think>), code fences e qualquer texto anterior ao H1 */
@@ -403,16 +413,25 @@ function cleanReport(rawText) {
 }
 
 async function generateReport(analysisData) {
-    const maxTokens = parseInt(optEnv('DASHBOARD_MAX_TOKENS', '4096'), 10)
+    const models = (process.env.OPENROUTER_MODEL || DEFAULT_MODEL).split(',').map(m => m.trim()).filter(Boolean)
+    const maxTokens = parseInt(process.env.DASHBOARD_MAX_TOKENS ?? '8192', 10) || 8192
     const userPrompt = `MÉTRICAS CONSOLIDADAS DA EMPRESA:\n\n${JSON.stringify(analysisData, null, 2)}`
-    let lastError
+    const deadline = Date.now() + REPORT_BUDGET_MS
+    let lastError = new Error('Tempo esgotado antes da geração do relatório.')
 
-    for (let attempt = 1; attempt <= REPORT_MAX_ATTEMPTS; attempt++) {
-        try {
-            return cleanReport(await callOpenRouter(SYSTEM_PROMPT_DASHBOARD, userPrompt, maxTokens))
-        } catch (err) {
-            lastError = err
-            console.warn(`[dashboard] Relatório — tentativa ${attempt}/${REPORT_MAX_ATTEMPTS} falhou:`, err.message)
+    for (const model of models) {
+        for (let attempt = 1; attempt <= ATTEMPTS_PER_MODEL; attempt++) {
+            const remaining = deadline - Date.now()
+            if (remaining < 5_000) throw lastError
+
+            try {
+                const raw = await callOpenRouter(model, userPrompt, maxTokens, Math.min(OPENROUTER_TIMEOUT_MS, remaining))
+                return cleanReport(raw)
+            } catch (err) {
+                lastError = err
+                console.warn(`[dashboard] ${model} — tentativa ${attempt}/${ATTEMPTS_PER_MODEL} falhou:`, err.message)
+                if (NON_RETRYABLE_STATUS.has(err.status)) break
+            }
         }
     }
 
@@ -432,21 +451,19 @@ async function runAnalysis(userId, trigger) {
     _inFlight.add(userId)
 
     try {
-        const [meetings, previous] = await Promise.all([
-            dbFetchMeetings(userId),
+        const [previous, lastMeetingAt] = await Promise.all([
             dbGetLatestDashboard(userId),
+            dbGetLastMeetingDate(userId),
         ])
 
-        if (!meetings.length) return { status: 'no_data' }
+        if (!lastMeetingAt) return { status: 'no_data' }
 
-        // Sem novas análises desde o último snapshot: evita duplicar registro e custo de modelo
-        if (previous) {
-            const lastGeneratedAt = new Date(previous.created_at)
-            if (!meetings.some(m => new Date(m.created_at) > lastGeneratedAt)) {
-                return { status: 'up_to_date', id: previous.id, created_at: previous.created_at }
-            }
+        // Sem transcrições novas desde o último snapshot: os dados não mudaram
+        if (previous && !hasNewMeetings(previous, lastMeetingAt)) {
+            return { status: 'up_to_date', id: previous.id, created_at: previous.created_at }
         }
 
+        const meetings = await dbFetchMeetings(userId)
         const previousAverage = previous?.analysis_data?.overall?.average
         const analysisData = buildAnalysisData(
             meetings,
@@ -463,12 +480,7 @@ async function runAnalysis(userId, trigger) {
             return { status: 'generation_failed' }
         }
 
-        const record = await dbSaveDashboard(
-            userId, report, analysisData,
-            analysisData.overall.growth_rate, analysisData.total_analyses,
-        )
-
-        return { status: 'completed', record }
+        return { status: 'completed', record: await dbSaveDashboard(userId, report, analysisData) }
     } finally {
         _inFlight.delete(userId)
     }
@@ -478,19 +490,8 @@ async function runAnalysis(userId, trigger) {
 
 /**
  * POST ?action=generate
- *
- * Resposta (200 — status "completed"):
- * {
- *   "status":           "completed",
- *   "id":               "uuid",
- *   "performance_rate": 4.35,
- *   "total_analyses":   18,
- *   "created_at":       "ISO 8601"
- * }
- *
- * Resposta (200 — status "up_to_date"): nenhuma análise nova desde o último snapshot
- * { "status": "up_to_date", "id": "uuid", "created_at": "ISO 8601", "message": "..." }
- *
+ * 200 completed:  { status, id, performance_rate, total_analyses, created_at }
+ * 200 up_to_date: { status, id, created_at, message }
  * Erros: 409 (em andamento) | 422 (sem métricas) | 502 (falha do modelo)
  */
 async function handleGenerate(res, userId) {
@@ -505,7 +506,7 @@ async function handleGenerate(res, userId) {
                 status: 'up_to_date',
                 id: result.id,
                 created_at: result.created_at,
-                message: 'Nenhuma análise nova desde a última geração.',
+                message: 'Nenhuma transcrição nova desde a última análise geral.',
             })
 
         case 'no_data':
@@ -519,25 +520,18 @@ async function handleGenerate(res, userId) {
     }
 }
 
-const CRON_SUMMARY_KEYS = {
-    completed: 'generated',
-    up_to_date: 'up_to_date',
-    no_data: 'no_data',
-    in_progress: 'skipped_in_progress',
-    generation_failed: 'failed',
-}
-
 /** GET ?action=cron — executado pela Vercel Cron toda segunda-feira */
 async function handleCron(res) {
     const startedAt = Date.now()
     const userIds = await dbListUserIds()
     const summary = {
         total_users: userIds.length,
-        generated: 0,
+        completed: 0,
         up_to_date: 0,
         no_data: 0,
-        skipped_in_progress: 0,
-        failed: 0,
+        in_progress: 0,
+        generation_failed: 0,
+        errors: 0,
         not_processed: 0,
     }
 
@@ -547,9 +541,9 @@ async function handleCron(res) {
             const userId = userIds[cursor++]
             try {
                 const { status } = await runAnalysis(userId, 'cron')
-                summary[CRON_SUMMARY_KEYS[status]]++
+                summary[status]++
             } catch (err) {
-                summary.failed++
+                summary.errors++
                 console.error(`[dashboard/cron] Erro (user ${userId}):`, err.message)
             }
         }
@@ -580,13 +574,13 @@ function isValidCronRequest(req) {
 // ─── Handler Principal ────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
-    // CORS — reutiliza _cors.js do projeto
     if (applyCors(req, res)) return
 
     applySecurityHeaders(res)
 
-    // A Vercel Cron chama o path sem query string: identifica a chamada pelo header do agendador
-    const action = req.query.action ?? (req.headers['x-vercel-cron-schedule'] ? 'cron' : undefined)
+    // A Vercel Cron faz GET no path configurado, sem garantia de query string;
+    // a autenticidade é garantida pelo CRON_SECRET, não pela rota.
+    const action = req.query.action ?? (req.method === 'GET' ? 'cron' : undefined)
 
     try {
         switch (action) {
@@ -598,7 +592,6 @@ export default async function handler(req, res) {
             case 'generate': {
                 if (req.method !== 'POST') return sendError(res, 405, 'Método não permitido.')
 
-                // Autenticação via cookie de sessão JWT — mesmo padrão de analysis/index.js
                 const userId = getUserId(req)
                 if (!userId) return sendError(res, 401, 'Não autenticado.')
 
@@ -606,11 +599,10 @@ export default async function handler(req, res) {
             }
 
             default:
-                return sendError(res, 400, `Ação desconhecida: "${action}".`)
+                return sendError(res, 400, 'Ação desconhecida.')
         }
     } catch (err) {
         console.error(`[dashboard/${action}] Erro inesperado:`, err.message)
-        // Nunca expõe stack trace ao cliente
         return sendError(res, 500, 'Erro interno do servidor.')
     }
 }
