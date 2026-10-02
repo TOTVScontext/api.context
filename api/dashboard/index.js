@@ -34,7 +34,7 @@ import { applyCors } from '../_cors.js'
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
-const DEFAULT_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free'
+const DEFAULT_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free, qwen/qwen3.8-27b:free'
 const OPENROUTER_TIMEOUT_MS = 90_000
 const REPORT_BUDGET_MS = 150_000
 const DEFAULT_MAX_TOKENS = 16_384
