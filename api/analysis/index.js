@@ -333,7 +333,7 @@ function checkRateLimit(userId) {
  * Lança erro em caso de falha na API.
  */
 async function callOpenRouter(systemPrompt, userMessage, maxTokens) {
-    const model = optEnv('OPENROUTER_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b:free')
+    const model = optEnv('OPENROUTER_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'qwen/qwen3.8-27b:free')
 
     const response = await fetch(OPENROUTER_URL, {
         method: 'POST',
