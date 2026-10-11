@@ -5,8 +5,7 @@
  *
  * Rotas → ?action=<ação>
  * ───────────────────────────────────────────────────────────────────────────────
- *  POST  ?action=auth_init      Inicia fluxo OAuth PKCE — retorna URL + state
- *  POST  ?action=auth_exchange  Troca code+verifier por tokens; emite JWT de sessão
+ *  POST  ?action=auth_login     Autentica com email+senha; emite JWT de sessão
  *  POST  ?action=auth_refresh   Renova access_token com refresh_token
  *  GET   ?action=me             Retorna dados do usuário autenticado
  *  POST  ?action=logout         Revoga refresh_token e limpa sessão
@@ -19,7 +18,7 @@
  * ───────────────────────────────────────────────────────────────────────────────
  *  SUPABASE_URL              URL pública do projeto Supabase
  *  SUPABASE_SERVICE_ROLE_KEY Chave service-role (somente backend)
- *  SUPABASE_ANON_KEY         Chave anon pública (troca de code OAuth)
+ *  SUPABASE_ANON_KEY         Chave anon pública
  *  JWT_SECRET                Segredo para assinar o JWT de sessão CLI
  */
 
@@ -33,9 +32,7 @@ const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 const ANON_KEY = process.env.SUPABASE_ANON_KEY
 const JWT_SECRET = process.env.JWT_SECRET
 
-const CLI_REDIRECT_URI = 'http://localhost:9876/callback'
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30 // 30 dias
-const STATE_TTL_MS = 10 * 60 * 1000            // 10 minutos
 const PAGE_SIZE_DEFAULT = 20
 const PAGE_SIZE_MAX = 50
 
@@ -49,7 +46,7 @@ function supabaseAnon() {
   return createClient(SUPABASE_URL, ANON_KEY)
 }
 
-// ─── CORS (CLI não é browser — aceita qualquer origem, mas bloqueia cookies) ──
+// ─── CORS ─────────────────────────────────────────────────────────────────────
 
 function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*')
@@ -89,12 +86,12 @@ function extractToken(req) {
 function requireAuth(req, res) {
   const token = extractToken(req)
   if (!token) {
-    res.status(401).json({ error: 'Não autenticado. Execute /login primeiro.' })
+    res.status(401).json({ code: 401, error_code: 'unauthenticated', msg: 'Não autenticado. Execute /login primeiro.' })
     return null
   }
   const payload = verifyCliSession(token)
   if (!payload) {
-    res.status(401).json({ error: 'Sessão expirada ou inválida. Execute /login.' })
+    res.status(401).json({ code: 401, error_code: 'session_expired', msg: 'Sessão expirada. Execute /login novamente.' })
     return null
   }
   return payload
@@ -102,197 +99,130 @@ function requireAuth(req, res) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function err(res, status, message) {
-  if (!res.headersSent) res.status(status).json({ error: message })
+function err(res, status, errorCode, message) {
+  if (!res.headersSent) {
+    res.status(status).json({ code: status, error_code: errorCode, msg: message })
+  }
 }
 
-function requireEnv(key) {
-  const v = process.env[key]
-  if (!v) throw new Error(`Variável de ambiente ausente: ${key}`)
-  return v
-}
+// ─── Rate limiting (in-memory; swap for Redis em multi-instância) ─────────────
 
-// ─── In-memory state store (PKCE state validation) ───────────────────────────
-// Em produção com múltiplas instâncias, substituir por Redis/Upstash KV.
-// Para um CLI single-user o risco é aceitável: cada fluxo tem TTL de 10 min.
+const _loginAttempts = new Map()
+const RATE_LIMIT = { MAX: 10, WINDOW_MS: 5 * 60 * 1000, LOCKOUT_MS: 3 * 60 * 1000 }
 
-const _stateStore = new Map() // state → { codeVerifier, expiresAt }
-
-function storeState(state, codeVerifier) {
-  // Limpa entradas expiradas periodicamente
+function checkRateLimit(ip) {
   const now = Date.now()
-  for (const [k, v] of _stateStore) {
-    if (now > v.expiresAt) _stateStore.delete(k)
+  const rec = _loginAttempts.get(ip)
+  if (!rec) return { allowed: true }
+  if (rec.lockedUntil && now < rec.lockedUntil) {
+    return { allowed: false, retryAfter: Math.ceil((rec.lockedUntil - now) / 1000) }
   }
-  _stateStore.set(state, { codeVerifier, expiresAt: now + STATE_TTL_MS })
+  if (now - rec.firstAttempt > RATE_LIMIT.WINDOW_MS) {
+    _loginAttempts.delete(ip)
+    return { allowed: true }
+  }
+  if (rec.count >= RATE_LIMIT.MAX) {
+    rec.lockedUntil = now + RATE_LIMIT.LOCKOUT_MS
+    _loginAttempts.set(ip, rec)
+    return { allowed: false, retryAfter: Math.ceil(RATE_LIMIT.LOCKOUT_MS / 1000) }
+  }
+  return { allowed: true }
 }
 
-function consumeState(state) {
-  const entry = _stateStore.get(state)
-  if (!entry) return null
-  if (Date.now() > entry.expiresAt) {
-    _stateStore.delete(state)
-    return null
-  }
-  _stateStore.delete(state)
-  return entry.codeVerifier
+function recordFailedLogin(ip) {
+  const now = Date.now()
+  const rec = _loginAttempts.get(ip) || { count: 0, firstAttempt: now }
+  rec.count++
+  _loginAttempts.set(ip, rec)
+}
+
+function clearLoginAttempts(ip) {
+  _loginAttempts.delete(ip)
+}
+
+function clientIp(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0].trim()
+    || req.headers['x-real-ip']
+    || req.socket?.remoteAddress
+    || 'unknown'
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /**
- * POST ?action=auth_init
+ * POST ?action=auth_login
  *
- * Gera URL de autorização OAuth PKCE para abrir no browser.
+ * Autentica com email + senha via Supabase e emite um JWT de sessão CLI.
  *
- * Body: { code_verifier: string, state: string }
- * Resposta: { url: string, state: string }
- *
- * O CLI gera code_verifier e state localmente, envia ao backend para
- * armazenar o state→verifier e receber a URL do Supabase Auth.
+ * Body: { email: string, password: string }
+ * Resposta: { session_token: string, email: string }
  */
-async function handleAuthInit(req, res) {
-  if (req.method !== 'POST') return err(res, 405, 'Método não permitido.')
+async function handleAuthLogin(req, res) {
+  if (req.method !== 'POST') return err(res, 405, 'method_not_allowed', 'Método não permitido.')
 
-  const { code_verifier, state } = req.body ?? {}
-  if (!code_verifier || !state) {
-    return err(res, 400, 'code_verifier e state são obrigatórios.')
-  }
-  if (typeof code_verifier !== 'string' || code_verifier.length < 43) {
-    return err(res, 400, 'code_verifier inválido (mínimo 43 chars).')
-  }
-  if (typeof state !== 'string' || state.length < 16) {
-    return err(res, 400, 'state inválido (mínimo 16 chars).')
+  const ip = clientIp(req)
+  const { allowed, retryAfter } = checkRateLimit(ip)
+  if (!allowed) {
+    res.setHeader('Retry-After', retryAfter)
+    return err(res, 429, 'rate_limited', `Muitas tentativas. Aguarde ${retryAfter}s e tente novamente.`)
   }
 
-  requireEnv('SUPABASE_URL')
-  requireEnv('SUPABASE_ANON_KEY')
+  const { email, password } = req.body ?? {}
 
-  // Deriva code_challenge (S256) — SHA-256(code_verifier) base64url
-  const encoder = new TextEncoder()
-  const data = encoder.encode(code_verifier)
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data)
-  const hashArray = new Uint8Array(hashBuffer)
-  const base64 = btoa(String.fromCharCode(...hashArray))
-  const code_challenge = base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+    return err(res, 400, 'validation_failed', 'E-mail inválido.')
+  }
+  if (!password || typeof password !== 'string' || password.length < 6) {
+    return err(res, 400, 'validation_failed', 'Senha inválida.')
+  }
 
-  storeState(state, code_verifier)
-
-  const params = new URLSearchParams({
-    client_id: 'your-client-id', // Supabase usa o project ref implicitamente no PKCE flow
-    response_type: 'code',
-    redirect_uri: CLI_REDIRECT_URI,
-    code_challenge,
-    code_challenge_method: 'S256',
-    state,
+  const sb = supabaseAnon()
+  const { data, error } = await sb.auth.signInWithPassword({
+    email: email.trim().toLowerCase(),
+    password,
   })
 
-  // A URL canônica do Supabase Auth para PKCE
-  const url = `${SUPABASE_URL}/auth/v1/authorize?${params.toString()}&provider=email`
-
-  return res.status(200).json({ url, state })
-}
-
-/**
- * POST ?action=auth_exchange
- *
- * Troca o authorization code por tokens usando a API do Supabase.
- *
- * Body: { code: string, state: string }
- * Resposta: { session_token: string, user: { id, email } }
- */
-async function handleAuthExchange(req, res) {
-  if (req.method !== 'POST') return err(res, 405, 'Método não permitido.')
-
-  const { code, state } = req.body ?? {}
-  if (!code || !state) return err(res, 400, 'code e state são obrigatórios.')
-
-  const codeVerifier = consumeState(state)
-  if (!codeVerifier) {
-    return err(res, 400, 'State inválido, expirado ou já utilizado. Inicie um novo login.')
+  if (error || !data?.user) {
+    recordFailedLogin(ip)
+    return err(res, 401, 'invalid_credentials', 'Credenciais inválidas.')
   }
 
-  // Troca o code pelo token via Supabase Auth REST
-  const tokenRes = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=pkce`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'apikey': ANON_KEY,
-    },
-    body: JSON.stringify({
-      auth_code: code,
-      code_verifier: codeVerifier,
-      redirect_uri: CLI_REDIRECT_URI,
-    }),
-  })
+  clearLoginAttempts(ip)
 
-  if (!tokenRes.ok) {
-    const body = await tokenRes.text().catch(() => '')
-    console.error('[cli/auth_exchange] Supabase error:', tokenRes.status, body)
-    return err(res, 401, 'Falha na autenticação. Código inválido ou expirado.')
-  }
-
-  const tokens = await tokenRes.json()
-  const { access_token, refresh_token, user } = tokens
-
-  if (!access_token || !user?.id) {
-    return err(res, 502, 'Resposta inválida do Supabase Auth.')
-  }
-
-  const sessionToken = issueCliSession(user.id, refresh_token)
-
-  return res.status(200).json({
-    session_token: sessionToken,
-    user: { id: user.id, email: user.email },
-  })
+  const sessionToken = issueCliSession(data.user.id, data.session?.refresh_token ?? '')
+  return res.status(200).json({ session_token: sessionToken, email: data.user.email })
 }
 
 /**
  * POST ?action=auth_refresh
  *
  * Renova a sessão CLI usando o refresh_token embutido no JWT atual.
- *
- * Header: Authorization: Bearer <session_token>
- * Resposta: { session_token: string }
  */
 async function handleAuthRefresh(req, res) {
-  if (req.method !== 'POST') return err(res, 405, 'Método não permitido.')
+  if (req.method !== 'POST') return err(res, 405, 'method_not_allowed', 'Método não permitido.')
 
   const payload = requireAuth(req, res)
   if (!payload) return
 
   const { rt: refreshToken } = payload
-  if (!refreshToken) return err(res, 401, 'Sessão sem refresh token. Execute /login.')
+  if (!refreshToken) return err(res, 401, 'no_refresh_token', 'Sessão sem refresh token. Execute /login.')
 
-  const refreshRes = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'apikey': ANON_KEY,
-    },
-    body: JSON.stringify({ refresh_token: refreshToken }),
-  })
+  const sb = supabaseAnon()
+  const { data, error } = await sb.auth.refreshSession({ refresh_token: refreshToken })
 
-  if (!refreshRes.ok) {
-    return err(res, 401, 'Sessão expirada. Execute /login novamente.')
+  if (error || !data?.user) {
+    return err(res, 401, 'refresh_failed', 'Sessão expirada. Execute /login novamente.')
   }
 
-  const tokens = await refreshRes.json()
-  const { refresh_token: newRefreshToken, user } = tokens
-
-  if (!user?.id) return err(res, 502, 'Resposta inválida do Supabase Auth.')
-
-  const sessionToken = issueCliSession(user.id, newRefreshToken ?? refreshToken)
+  const sessionToken = issueCliSession(data.user.id, data.session?.refresh_token ?? refreshToken)
   return res.status(200).json({ session_token: sessionToken })
 }
 
 /**
  * GET ?action=me
- *
- * Retorna email e ID do usuário autenticado.
  */
 async function handleMe(req, res) {
-  if (req.method !== 'GET') return err(res, 405, 'Método não permitido.')
+  if (req.method !== 'GET') return err(res, 405, 'method_not_allowed', 'Método não permitido.')
 
   const payload = requireAuth(req, res)
   if (!payload) return
@@ -304,34 +234,26 @@ async function handleMe(req, res) {
     .eq('id', payload.sub)
     .maybeSingle()
 
-  if (error) return err(res, 500, 'Erro ao buscar usuário.')
-  if (!data) return err(res, 404, 'Usuário não encontrado.')
+  if (error) return err(res, 500, 'db_error', 'Erro ao buscar usuário.')
+  if (!data) return err(res, 404, 'not_found', 'Usuário não encontrado.')
 
   return res.status(200).json(data)
 }
 
 /**
  * POST ?action=logout
- *
- * Revoga o refresh_token no Supabase e instrui o CLI a descartar o JWT.
  */
 async function handleLogout(req, res) {
-  if (req.method !== 'POST') return err(res, 405, 'Método não permitido.')
+  if (req.method !== 'POST') return err(res, 405, 'method_not_allowed', 'Método não permitido.')
 
   const payload = requireAuth(req, res)
   if (!payload) return
 
   const { rt: refreshToken } = payload
-
   if (refreshToken) {
-    await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': ANON_KEY,
-        'Authorization': `Bearer ${refreshToken}`,
-      },
-    }).catch(() => { }) // revogação best-effort
+    // Revoga o refresh token no Supabase (best-effort)
+    const sb = supabaseAnon()
+    await sb.auth.signOut().catch(() => { })
   }
 
   return res.status(200).json({ success: true })
@@ -339,38 +261,25 @@ async function handleLogout(req, res) {
 
 /**
  * POST ?action=save_meeting
- *
- * Persiste análise estruturada em public.meetings.
- * Nunca escreve na coluna `analysis` (reservada para o webapp).
- *
- * Body: {
- *   idempotency_key: string,   // UUID gerado pelo CLI antes da chamada
- *   title: string,
- *   transcription: object,
- *   goal: 'success'|'partial'|'fail',
- *   size: string,
- *   analysis_data: object      // schema completo conforme spec
- * }
  */
 async function handleSaveMeeting(req, res) {
-  if (req.method !== 'POST') return err(res, 405, 'Método não permitido.')
+  if (req.method !== 'POST') return err(res, 405, 'method_not_allowed', 'Método não permitido.')
 
   const payload = requireAuth(req, res)
   if (!payload) return
 
   const userId = payload.sub
   const body = req.body ?? {}
-
   const { idempotency_key, title, transcription, goal, size, analysis_data } = body
 
   if (!idempotency_key || typeof idempotency_key !== 'string') {
-    return err(res, 400, 'idempotency_key é obrigatório.')
+    return err(res, 400, 'validation_failed', 'idempotency_key é obrigatório.')
   }
   if (!title || typeof title !== 'string') {
-    return err(res, 400, 'title é obrigatório.')
+    return err(res, 400, 'validation_failed', 'title é obrigatório.')
   }
   if (!analysis_data || typeof analysis_data !== 'object') {
-    return err(res, 400, 'analysis_data é obrigatório e deve ser um objeto.')
+    return err(res, 400, 'validation_failed', 'analysis_data é obrigatório.')
   }
 
   const VALID_GOALS = new Set(['success', 'partial', 'fail'])
@@ -378,7 +287,7 @@ async function handleSaveMeeting(req, res) {
 
   const sb = supabaseAdmin()
 
-  // Idempotência: checa se já existe registro com este idempotency_key
+  // Idempotência
   const { data: existing } = await sb
     .from('meetings')
     .select('id, title, created_at, analysis_data')
@@ -386,10 +295,7 @@ async function handleSaveMeeting(req, res) {
     .eq('user_id', userId)
     .maybeSingle()
 
-  if (existing) {
-    // Já salvo — retorna o registro existente sem duplicar
-    return res.status(200).json({ ...existing, already_existed: true })
-  }
+  if (existing) return res.status(200).json({ ...existing, already_existed: true })
 
   const { data, error } = await sb
     .from('meetings')
@@ -401,14 +307,13 @@ async function handleSaveMeeting(req, res) {
       goal: safeGoal,
       size: size ?? null,
       analysis_data,
-      // analysis: NÃO escrito aqui — reservado para o webapp
     })
     .select('id, title, created_at, analysis_data')
     .single()
 
   if (error) {
-    console.error('[cli/save_meeting] Supabase error:', error.message)
-    return err(res, 500, 'Falha ao salvar reunião: ' + error.message)
+    console.error('[cli/save_meeting]', error.message)
+    return err(res, 500, 'db_error', 'Falha ao salvar reunião: ' + error.message)
   }
 
   return res.status(201).json(data)
@@ -418,7 +323,7 @@ async function handleSaveMeeting(req, res) {
  * GET ?action=list_meetings&page=1&page_size=20
  */
 async function handleListMeetings(req, res) {
-  if (req.method !== 'GET') return err(res, 405, 'Método não permitido.')
+  if (req.method !== 'GET') return err(res, 405, 'method_not_allowed', 'Método não permitido.')
 
   const payload = requireAuth(req, res)
   if (!payload) return
@@ -436,7 +341,7 @@ async function handleListMeetings(req, res) {
     .order('created_at', { ascending: false })
     .range(from, to)
 
-  if (error) return err(res, 500, 'Erro ao listar reuniões.')
+  if (error) return err(res, 500, 'db_error', 'Erro ao listar reuniões.')
 
   return res.status(200).json({ meetings: data, total: count, page, page_size: pageSize })
 }
@@ -445,13 +350,13 @@ async function handleListMeetings(req, res) {
  * GET ?action=get_meeting&id=<uuid>
  */
 async function handleGetMeeting(req, res) {
-  if (req.method !== 'GET') return err(res, 405, 'Método não permitido.')
+  if (req.method !== 'GET') return err(res, 405, 'method_not_allowed', 'Método não permitido.')
 
   const payload = requireAuth(req, res)
   if (!payload) return
 
   const { id } = req.query
-  if (!id) return err(res, 400, 'Parâmetro id é obrigatório.')
+  if (!id) return err(res, 400, 'validation_failed', 'Parâmetro id é obrigatório.')
 
   const sb = supabaseAdmin()
   const { data, error } = await sb
@@ -461,8 +366,8 @@ async function handleGetMeeting(req, res) {
     .eq('user_id', payload.sub)
     .maybeSingle()
 
-  if (error) return err(res, 500, 'Erro ao buscar reunião.')
-  if (!data) return err(res, 404, 'Reunião não encontrada.')
+  if (error) return err(res, 500, 'db_error', 'Erro ao buscar reunião.')
+  if (!data) return err(res, 404, 'not_found', 'Reunião não encontrada.')
 
   return res.status(200).json(data)
 }
@@ -471,17 +376,16 @@ async function handleGetMeeting(req, res) {
  * DELETE ?action=delete_meeting&id=<uuid>
  */
 async function handleDeleteMeeting(req, res) {
-  if (req.method !== 'DELETE') return err(res, 405, 'Método não permitido.')
+  if (req.method !== 'DELETE') return err(res, 405, 'method_not_allowed', 'Método não permitido.')
 
   const payload = requireAuth(req, res)
   if (!payload) return
 
   const { id } = req.query
-  if (!id) return err(res, 400, 'Parâmetro id é obrigatório.')
+  if (!id) return err(res, 400, 'validation_failed', 'Parâmetro id é obrigatório.')
 
   const sb = supabaseAdmin()
 
-  // Verifica ownership
   const { data: record } = await sb
     .from('meetings')
     .select('id')
@@ -489,7 +393,7 @@ async function handleDeleteMeeting(req, res) {
     .eq('user_id', payload.sub)
     .maybeSingle()
 
-  if (!record) return err(res, 404, 'Reunião não encontrada.')
+  if (!record) return err(res, 404, 'not_found', 'Reunião não encontrada.')
 
   const { error } = await sb
     .from('meetings')
@@ -497,7 +401,7 @@ async function handleDeleteMeeting(req, res) {
     .eq('id', id)
     .eq('user_id', payload.sub)
 
-  if (error) return err(res, 500, 'Erro ao excluir reunião.')
+  if (error) return err(res, 500, 'db_error', 'Erro ao excluir reunião.')
 
   return res.status(200).json({ success: true })
 }
@@ -514,8 +418,7 @@ export default async function handler(req, res) {
 
   try {
     switch (action) {
-      case 'auth_init': return await handleAuthInit(req, res)
-      case 'auth_exchange': return await handleAuthExchange(req, res)
+      case 'auth_login': return await handleAuthLogin(req, res)
       case 'auth_refresh': return await handleAuthRefresh(req, res)
       case 'me': return await handleMe(req, res)
       case 'logout': return await handleLogout(req, res)
@@ -524,10 +427,10 @@ export default async function handler(req, res) {
       case 'get_meeting': return await handleGetMeeting(req, res)
       case 'delete_meeting': return await handleDeleteMeeting(req, res)
       default:
-        return err(res, 400, `Ação desconhecida: "${action}". Verifique a documentação.`)
+        return err(res, 400, 'unknown_action', `Ação desconhecida: "${action}".`)
     }
   } catch (e) {
-    console.error(`[cli/${action}] Erro inesperado:`, e.message)
-    return err(res, 500, 'Erro interno do servidor.')
+    console.error(`[cli/${action}]`, e.message)
+    return err(res, 500, 'internal_error', 'Erro interno do servidor.')
   }
 }
