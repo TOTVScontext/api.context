@@ -27,14 +27,14 @@ import { createClient } from '@supabase/supabase-js'
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const SUPABASE_URL      = process.env.SUPABASE_URL
-const SERVICE_ROLE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY
-const ANON_KEY          = process.env.SUPABASE_ANON_KEY
-const JWT_SECRET        = process.env.JWT_SECRET
+const SUPABASE_URL = process.env.SUPABASE_URL
+const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
+const ANON_KEY = process.env.SUPABASE_ANON_KEY
+const JWT_SECRET = process.env.JWT_SECRET
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30 // 30 dias
-const PAGE_SIZE_DEFAULT   = 20
-const PAGE_SIZE_MAX       = 50
+const PAGE_SIZE_DEFAULT = 20
+const PAGE_SIZE_MAX = 50
 
 // ─── Supabase clients ─────────────────────────────────────────────────────────
 
@@ -204,9 +204,9 @@ async function handleAuthLogin(req, res) {
 
   return res.status(200).json({
     session_token: sessionToken,
-    email:         data.user.email,
-    name:          userRow?.name ?? null,
-    plan:          userRow?.plan ?? null,
+    email: data.user.email,
+    name: userRow?.name ?? null,
+    plan: userRow?.plan ?? null,
   })
 }
 
@@ -254,7 +254,7 @@ async function handleMe(req, res) {
     .maybeSingle()
 
   if (error) return err(res, 500, 'db_error', 'Erro ao buscar usuário.')
-  if (!data)  return err(res, 404, 'not_found',  'Usuário não encontrado.')
+  if (!data) return err(res, 404, 'not_found', 'Usuário não encontrado.')
 
   return res.status(200).json(data)
 }
@@ -271,7 +271,7 @@ async function handleLogout(req, res) {
   const { rt: refreshToken } = payload
   if (refreshToken) {
     const sb = supabaseAnon()
-    await sb.auth.signOut().catch(() => {})
+    await sb.auth.signOut().catch(() => { })
   }
 
   return res.status(200).json({ success: true })
@@ -287,7 +287,7 @@ async function handleSaveMeeting(req, res) {
   if (!payload) return
 
   const userId = payload.sub
-  const body   = req.body ?? {}
+  const body = req.body ?? {}
   const { idempotency_key, title, transcription, goal, size, analysis_data } = body
 
   if (!idempotency_key || typeof idempotency_key !== 'string') {
@@ -301,7 +301,7 @@ async function handleSaveMeeting(req, res) {
   }
 
   const VALID_GOALS = new Set(['success', 'partial', 'fail'])
-  const safeGoal    = VALID_GOALS.has(goal) ? goal : 'partial'
+  const safeGoal = VALID_GOALS.has(goal) ? goal : 'partial'
 
   const sb = supabaseAdmin()
 
@@ -318,12 +318,12 @@ async function handleSaveMeeting(req, res) {
   const { data, error } = await sb
     .from('meetings')
     .insert({
-      id:            idempotency_key,
-      user_id:       userId,
-      title:         String(title).slice(0, 255),
+      id: idempotency_key,
+      user_id: userId,
+      title: String(title).slice(0, 255),
       transcription: transcription ?? null,
-      goal:          safeGoal,
-      size:          size ?? null,
+      goal: safeGoal,
+      size: size ?? null,
       analysis_data,
     })
     .select('id, title, created_at, analysis_data')
@@ -346,16 +346,23 @@ async function handleListMeetings(req, res) {
   const payload = requireAuth(req, res)
   if (!payload) return
 
-  const page     = Math.max(1, parseInt(req.query.page      ?? '1',                        10))
+  const page = Math.max(1, parseInt(req.query.page ?? '1', 10))
   const pageSize = Math.min(PAGE_SIZE_MAX, Math.max(1, parseInt(req.query.page_size ?? String(PAGE_SIZE_DEFAULT), 10)))
-  const from     = (page - 1) * pageSize
-  const to       = from + pageSize - 1
+  const from = (page - 1) * pageSize
+  const to = from + pageSize - 1
+  const exactTitle = typeof req.query.title === 'string' ? req.query.title.trim() : ''
+  const titlePrefix = typeof req.query.title_prefix === 'string' ? req.query.title_prefix.trim() : ''
 
   const sb = supabaseAdmin()
-  const { data, error, count } = await sb
+  let query = sb
     .from('meetings')
     .select('id, title, goal, size, created_at, analysis_data', { count: 'exact' })
     .eq('user_id', payload.sub)
+
+  if (exactTitle) query = query.eq('title', exactTitle)
+  if (titlePrefix) query = query.ilike('title', `${titlePrefix}%`)
+
+  const { data, error, count } = await query
     .order('created_at', { ascending: false })
     .range(from, to)
 
@@ -385,7 +392,7 @@ async function handleGetMeeting(req, res) {
     .maybeSingle()
 
   if (error) return err(res, 500, 'db_error', 'Erro ao buscar reunião.')
-  if (!data)  return err(res, 404, 'not_found',  'Reunião não encontrada.')
+  if (!data) return err(res, 404, 'not_found', 'Reunião não encontrada.')
 
   return res.status(200).json(data)
 }
@@ -436,13 +443,13 @@ export default async function handler(req, res) {
 
   try {
     switch (action) {
-      case 'auth_login':     return await handleAuthLogin(req, res)
-      case 'auth_refresh':   return await handleAuthRefresh(req, res)
-      case 'me':             return await handleMe(req, res)
-      case 'logout':         return await handleLogout(req, res)
-      case 'save_meeting':   return await handleSaveMeeting(req, res)
-      case 'list_meetings':  return await handleListMeetings(req, res)
-      case 'get_meeting':    return await handleGetMeeting(req, res)
+      case 'auth_login': return await handleAuthLogin(req, res)
+      case 'auth_refresh': return await handleAuthRefresh(req, res)
+      case 'me': return await handleMe(req, res)
+      case 'logout': return await handleLogout(req, res)
+      case 'save_meeting': return await handleSaveMeeting(req, res)
+      case 'list_meetings': return await handleListMeetings(req, res)
+      case 'get_meeting': return await handleGetMeeting(req, res)
       case 'delete_meeting': return await handleDeleteMeeting(req, res)
       default:
         return err(res, 400, 'unknown_action', `Ação desconhecida: "${action}".`)
