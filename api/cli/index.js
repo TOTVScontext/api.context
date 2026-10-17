@@ -277,27 +277,6 @@ async function handleLogout(req, res) {
   return res.status(200).json({ success: true })
 }
 
-const REPORT_SYSTEM_PROMPT = `Você é um consultor sênior de reuniões B2B. Gere um relatório executivo em Markdown, em português do Brasil, baseado exclusivamente na transcrição e nas métricas ML fornecidas. Nunca invente fatos. Use exatamente esta estrutura: # Relatório de Análise de Reunião; ## Sumário Executivo; ## Panorama de Métricas (uma tabela com 5-6 métricas e valores); ---; ## Engajamento & Comunicação; ## Saúde do Cliente & Progresso Comercial; ## Riscos Críticos; ## Inteligência Comercial & Próximos Passos; ## Veredito do Objetivo. Explique as métricas sem repetir a tabela, cite evidências textuais quando existirem e declare quando não houver evidência. Seja conciso, acionável e profissional. Termine com um comentário METADATA contendo objetivo_cumprido como success, partial ou fail.`
-
-async function generateCliReport(transcription, metrics) {
-  const key = process.env.OPENROUTER_API_KEY
-  if (!key) throw new Error('OPENROUTER_API_KEY não configurada')
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'X-Title': 'TOTVS Context CLI' },
-    body: JSON.stringify({
-      model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-nano-30b-a3b:free',
-      messages: [{ role: 'system', content: REPORT_SYSTEM_PROMPT }, { role: 'user', content: `TRANSCRIÇÃO:\n${String(transcription).slice(0, 120000)}\n\nMÉTRICAS ML (fonte local):\n${JSON.stringify(metrics)}` }],
-      max_tokens: Number(process.env.OPENROUTER_MAX_TOKENS || 3584), temperature: 0.2,
-    }),
-  })
-  if (!response.ok) throw new Error(`OpenRouter ${response.status}: ${await response.text()}`)
-  const data = await response.json()
-  const report = data?.choices?.[0]?.message?.content?.trim()
-  if (!report) throw new Error('LLM retornou relatório vazio')
-  return report.replace(/^```(?:markdown)?\s*/i, '').replace(/\s*```$/i, '').trim()
-}
-
 /**
  * POST ?action=save_meeting
  */
@@ -309,7 +288,7 @@ async function handleSaveMeeting(req, res) {
 
   const userId = payload.sub
   const body = req.body ?? {}
-  const { idempotency_key, title, transcription, goal, size, analysis_data, analysis } = body
+  const { idempotency_key, title, transcription, goal, size, analysis_data } = body
 
   if (!idempotency_key || typeof idempotency_key !== 'string') {
     return err(res, 400, 'validation_failed', 'idempotency_key é obrigatório.')
@@ -329,15 +308,12 @@ async function handleSaveMeeting(req, res) {
   // Idempotência
   const { data: existing } = await sb
     .from('meetings')
-    .select('id, title, created_at, analysis, analysis_data')
+    .select('id, title, created_at, analysis_data')
     .eq('id', idempotency_key)
     .eq('user_id', userId)
     .maybeSingle()
 
   if (existing) return res.status(200).json({ ...existing, already_existed: true })
-  let reportMarkdown = typeof analysis === 'string' && analysis.trim() ? analysis.trim() : null
-  try { reportMarkdown = reportMarkdown || await generateCliReport(transcription, analysis_data) }
-  catch (e) { console.error('[cli/report]', e.message); return err(res, 502, 'report_generation_failed', 'Métricas geradas, mas o relatório LLM não pôde ser criado.') }
 
   const { data, error } = await sb
     .from('meetings')
@@ -349,7 +325,6 @@ async function handleSaveMeeting(req, res) {
       goal: safeGoal,
       size: size ?? null,
       analysis_data,
-      analysis: reportMarkdown,
     })
     .select('id, title, created_at, analysis_data')
     .single()
@@ -411,7 +386,7 @@ async function handleGetMeeting(req, res) {
   const sb = supabaseAdmin()
   const { data, error } = await sb
     .from('meetings')
-    .select('id, title, goal, size, transcription, analysis, analysis_data, created_at')
+    .select('id, title, goal, size, transcription, analysis_data, created_at')
     .eq('id', id)
     .eq('user_id', payload.sub)
     .maybeSingle()
