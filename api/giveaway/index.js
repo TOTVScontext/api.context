@@ -54,20 +54,20 @@ function validate(body) {
     const { name, email, age, gender, size } = body
 
     if (!name || typeof name !== 'string' || name.trim().length < 2)
-        return 'Campo "name" é obrigatório e deve ter ao menos 2 caracteres.'
+        return 'Campo Nome é obrigatório e deve ter ao menos 2 caracteres.'
 
     if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
-        return 'Campo "email" inválido.'
+        return 'Campo E-mail inválido.'
 
     const parsedAge = Number(age)
     if (!age && age !== 0 || !Number.isInteger(parsedAge) || parsedAge < AGE_MIN || parsedAge > AGE_MAX)
-        return `Campo "age" deve ser um número inteiro entre ${AGE_MIN} e ${AGE_MAX}.`
+        return `Campo Idade deve ser um número inteiro entre ${AGE_MIN} e ${AGE_MAX}.`
 
     if (!gender || !ALLOWED_GENDERS.includes(gender))
-        return `Campo "gender" inválido. Valores aceitos: ${ALLOWED_GENDERS.join(', ')}.`
+        return `Campo Gênero inválido. Valores aceitos: ${ALLOWED_GENDERS.join(', ')}.`
 
     if (!size || !ALLOWED_SIZES.includes(size))
-        return `Campo "size" inválido. Valores aceitos: ${ALLOWED_SIZES.join(', ')}.`
+        return `Campo Tamanho inválido. Valores aceitos: ${ALLOWED_SIZES.join(', ')}.`
 
     return null
 }
@@ -113,7 +113,7 @@ async function handleSubmit(req, res) {
 
     const { email } = req.body
     const isDuplicate = await dbCheckDuplicate(email)
-    if (isDuplicate) return sendError(res, 409, 'Este e-mail já está registrado no giveaway.')
+    if (isDuplicate) return sendError(res, 409, 'Este e-mail já está registrado no sorteio.')
 
     const entry = await dbInsertEntry(req.body)
 
